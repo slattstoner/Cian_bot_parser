@@ -265,7 +265,7 @@ async def init_driver():
         options.add_argument(f'--proxy-server={PROXY_URL}')
     
     try:
-        driver = uc.Chrome(options=options, version_main=None)  # автоопределение
+driver = uc.Chrome(options=options, version_main=145)
         logger.info("✅ undetected_chromedriver успешно запущен")
     except Exception as e:
         logger.error(f"❌ Ошибка запуска драйвера: {e}")
