@@ -312,14 +312,14 @@ async def fetch_cian(districts, rooms, metros, owner_only):
 
     soup = BeautifulSoup(html, 'lxml')
 
-    # Универсальный поиск карточек объявлений
+# Универсальный поиск карточек объявлений
     cards = []
     # Пробуем разные селекторы
     selectors = [
         ('article', {'data-name': 'CardComponent'}),
-        ('div', class_=re.compile('_93444fe79c--card--')),
+        ('div', {'class': '_93444fe79c--card--'}),  # исправлено: словарь с class
         ('div', {'data-testid': 'offer-card'}),
-        ('article', {'class': re.compile('offer-card')}),
+        ('article', {'class': 'offer-card'}),
         ('div', {'class': 'catalog-offers'})
     ]
     for tag, attrs in selectors:
@@ -333,7 +333,6 @@ async def fetch_cian(districts, rooms, metros, owner_only):
         all_divs = soup.find_all('div', class_=re.compile('offer|card|item|container'))
         logger.info(f"Ничего не найдено, всего div'ов с offer/card: {len(all_divs)}")
         return []
-
     results = []
     for card in cards[:10]:
         try:
