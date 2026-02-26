@@ -471,13 +471,13 @@ async def fetch_daily_by_metro(metro_stations=None):
         return []
 
     soup = BeautifulSoup(html, 'lxml')
-    # Поиск карточек аналогично основному парсеру
+   # Поиск карточек аналогично основному парсеру
     cards = []
     selectors = [
         ('article', {'data-name': 'CardComponent'}),
-        ('div', class_=re.compile('_93444fe79c--card--')),
+        ('div', {'class': '_93444fe79c--card--'}),  # исправлено
         ('div', {'data-testid': 'offer-card'}),
-        ('article', {'class': re.compile('offer-card')}),
+        ('article', {'class': 'offer-card'}),
         ('div', {'class': 'catalog-offers'})
     ]
     for tag, attrs in selectors:
