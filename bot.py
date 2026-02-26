@@ -7,11 +7,10 @@ import random
 import re
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
+from threading import Thread
 
-import aiohttp
 import asyncpg
 from bs4 import BeautifulSoup
-from fake_useragent import UserAgent
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -22,6 +21,13 @@ from telegram.ext import (
     ContextTypes
 )
 from telegram.constants import ParseMode
+
+# Selenium и undetected-chromedriver
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
 
 # ========== НАСТРОЙКИ ==========
 TOKEN = os.environ.get('TOKEN')
@@ -50,7 +56,7 @@ PLAN_DAYS = {'1m': 30, '3m': 90, '6m': 180, '12m': 360}
 # ========== ДАННЫЕ ПО МОСКВЕ ==========
 DISTRICTS = ['ЦАО', 'САО', 'СВАО', 'ВАО', 'ЮВАО', 'ЮАО', 'ЮЗАО', 'ЗАО', 'СЗАО']
 ROOM_OPTIONS = ['Студия', '1-комнатная', '2-комнатная', '3-комнатная', '4-комнатная+']
-OWNER_TYPES = ['Все', 'Только собственники']  # для фильтра
+OWNER_TYPES = ['Все', 'Только собственники']
 
 METRO_LINES = {
     'ap': {'name': '🚇 Арбатско-Покровская',
@@ -96,7 +102,7 @@ DISTRICT_MAPPING = {
     "Северо-Западный административный округ": "СЗАО"
 }
 
-# ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
+# ========== ЛОГИРОВАНИЕ ==========
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -237,34 +243,96 @@ class Database:
         async with cls._pool.acquire() as conn:
             return await conn.fetch('SELECT user_id, filters FROM users WHERE subscribed_until > $1', now)
 
-# ========== ФУНКЦИИ ДЛЯ ОБХОДА БЛОКИРОВОК ==========
-ua = UserAgent()
+# ========== ГЛОБАЛЬНЫЙ ДРАЙВЕР ==========
+driver = None
+driver_lock = asyncio.Lock()
+request_counter = 0
+MAX_REQUESTS_PER_DRIVER = 50  # перезапускать драйвер после 50 запросов
 
-async def make_request(url, headers=None, params=None, retries=3):
-    """Выполняет HTTP-запрос с ротацией User-Agent, поддержкой прокси и повторными попытками."""
-    if headers is None:
-        headers = {}
-    headers['User-Agent'] = ua.random
-    headers['Accept-Language'] = 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
-    headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-    headers['Connection'] = 'keep-alive'
-    headers['Upgrade-Insecure-Requests'] = '1'
+async def init_driver():
+    """Инициализация undetected_chromedriver (запускается один раз)."""
+    global driver
+    options = uc.ChromeOptions()
+    options.add_argument('--headless=new')  # безголовый режим для сервера
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1920,1080')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    
+    if PROXY_URL:
+        options.add_argument(f'--proxy-server={PROXY_URL}')
+    
+    try:
+        driver = uc.Chrome(options=options, version_main=120)
+        logger.info("✅ undetected_chromedriver успешно запущен")
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска драйвера: {e}")
+        raise
 
-    connector = aiohttp.TCPConnector(ssl=False)
-    proxy = PROXY_URL if PROXY_URL else None
+async def restart_driver():
+    """Перезапуск драйвера при достижении лимита запросов или ошибке."""
+    global driver
+    async with driver_lock:
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
+        await init_driver()
 
-    for attempt in range(retries):
+async def get_page_html(url, params=None):
+    """Получить HTML страницы через undetected_chromedriver с имитацией поведения."""
+    global driver, request_counter
+    async with driver_lock:
+        if driver is None:
+            await init_driver()
+        
+        # Перезапуск по лимиту
+        request_counter += 1
+        if request_counter >= MAX_REQUESTS_PER_DRIVER:
+            logger.info("Перезапуск драйвера по лимиту запросов")
+            await restart_driver()
+            request_counter = 0
+        
         try:
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(url, params=params, headers=headers, proxy=proxy, timeout=30) as resp:
-                    if resp.status == 200:
-                        return await resp.text()
-                    else:
-                        logger.warning(f"Попытка {attempt+1}: статус {resp.status}")
+            full_url = url + '?' + urlencode(params) if params else url
+            logger.info(f"Загрузка страницы: {full_url}")
+            
+            # Загружаем страницу
+            driver.get(full_url)
+            
+            # Имитация человеческого поведения
+            # 1. Случайная задержка перед началом действий
+            time.sleep(random.uniform(2, 5))
+            
+            # 2. Плавная прокрутка страницы
+            scroll_height = driver.execute_script("return document.body.scrollHeight")
+            steps = random.randint(3, 6)
+            for i in range(1, steps+1):
+                scroll_to = (scroll_height // steps) * i
+                driver.execute_script(f"window.scrollTo(0, {scroll_to});")
+                time.sleep(random.uniform(0.5, 1.5))
+            
+            # 3. Небольшое движение мыши (имитация)
+            action = ActionChains(driver)
+            action.move_by_offset(random.randint(10, 100), random.randint(10, 100)).perform()
+            time.sleep(random.uniform(0.5, 1))
+            
+            # 4. Ждем появления карточек (или любого элемента)
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "article"))
+            )
+            
+            html = driver.page_source
+            logger.info(f"Страница загружена, длина HTML: {len(html)}")
+            return html
         except Exception as e:
-            logger.warning(f"Попытка {attempt+1} не удалась: {e}")
-        await asyncio.sleep((attempt + 1) * random.uniform(2, 5))
-    return None
+            logger.error(f"Ошибка при загрузке страницы: {e}")
+            # При ошибке перезапускаем драйвер
+            await restart_driver()
+            return None
 
 # ========== КЭШ ПАРСИНГА ==========
 parse_cache = {}  # key: tuple(...) -> (data, expiry)
@@ -273,7 +341,7 @@ def cache_key(districts, rooms, metros, owner_only):
     return (tuple(sorted(districts)), tuple(sorted(rooms)), tuple(sorted(metros)), owner_only)
 
 async def fetch_cian(districts, rooms, metros, owner_only):
-    """Асинхронный парсинг ЦИАН с учётом всех фильтров."""
+    """Парсинг через undetected-chromedriver."""
     key = cache_key(districts, rooms, metros, owner_only)
     now = time.time()
     if key in parse_cache and parse_cache[key][1] > now:
@@ -286,13 +354,13 @@ async def fetch_cian(districts, rooms, metros, owner_only):
         'offer_type': 'flat',
         'region': '1',
         'only_flat': '1',
-        'owner': '1' if owner_only else None,  # если только собственники, ставим owner=1, иначе убираем
         'sort': 'creation_date_desc',
         'p': '1'
     }
-    # Убираем None значения
-    params = {k: v for k, v in params.items() if v is not None}
-
+    # Добавляем фильтр собственников, если нужно
+    if owner_only:
+        params['owner'] = '1'
+    
     # Добавляем округа
     for d in districts:
         code = {'ЦАО':8, 'САО':9, 'СВАО':10, 'ВАО':11, 'ЮВАО':12, 'ЮАО':13, 'ЮЗАО':14, 'ЗАО':15, 'СЗАО':16}.get(d)
@@ -300,24 +368,19 @@ async def fetch_cian(districts, rooms, metros, owner_only):
             params[f'okrug[{code}]'] = '1'
 
     url = "https://www.cian.ru/cat.php"
-    logger.info(f"Парсинг: {url} с параметрами {params}")
-
-    html = await make_request(url, params=params)
+    html = await get_page_html(url, params)
     if not html:
-        logger.error("Не удалось получить HTML после нескольких попыток")
+        logger.error("Не удалось получить HTML страницы")
         return []
 
-    # Диагностика: сохраняем начало страницы в лог
-    logger.info(f"Первые 2000 символов ответа: {html[:2000]}")
-
+    # Парсинг HTML
     soup = BeautifulSoup(html, 'lxml')
-
-# Универсальный поиск карточек объявлений
+    
+    # Поиск карточек (селекторы могут потребовать обновления)
     cards = []
-    # Пробуем разные селекторы
     selectors = [
         ('article', {'data-name': 'CardComponent'}),
-        ('div', {'class': '_93444fe79c--card--'}),  # исправлено: словарь с class
+        ('div', {'class': '_93444fe79c--card--'}),
         ('div', {'data-testid': 'offer-card'}),
         ('article', {'class': 'offer-card'}),
         ('div', {'class': 'catalog-offers'})
@@ -329,10 +392,10 @@ async def fetch_cian(districts, rooms, metros, owner_only):
             cards = found
             break
     else:
-        # Если ничего не нашли, пробуем найти любые div с ценой
-        all_divs = soup.find_all('div', class_=re.compile('offer|card|item|container'))
-        logger.info(f"Ничего не найдено, всего div'ов с offer/card: {len(all_divs)}")
+        # Ничего не нашли
+        logger.warning("Карточки не найдены ни по одному селектору")
         return []
+
     results = []
     for card in cards[:10]:
         try:
@@ -375,7 +438,7 @@ async def fetch_cian(districts, rooms, metros, owner_only):
                 elif 'студия' in title.lower() or 'студия' in chars_text.lower():
                     rooms_count = 'студия'
 
-            # Проверка фильтра по комнатам
+            # Фильтр по комнатам
             if rooms:
                 room_type = None
                 if rooms_count == 'студия':
@@ -391,7 +454,7 @@ async def fetch_cian(districts, rooms, metros, owner_only):
                 if room_type not in rooms:
                     continue
 
-            # Характеристики (этаж, площадь)
+            # Этаж и площадь
             chars = card.find_all('span', class_=re.compile('characteristic'))
             chars_text = ' '.join(c.text for c in chars)
 
@@ -405,10 +468,9 @@ async def fetch_cian(districts, rooms, metros, owner_only):
             if am:
                 area = f"{am.group(1)} м²"
 
-            # Определение собственника
+            # Собственник
             owner_tag = card.find('span', text=re.compile('собственник', re.I))
             is_owner = bool(owner_tag)
-            # Если фильтр "только собственники" и это не собственник, пропускаем
             if owner_only and not is_owner:
                 continue
 
@@ -421,7 +483,7 @@ async def fetch_cian(districts, rooms, metros, owner_only):
                 if 'avatar' not in src and not src.endswith('.svg'):
                     photos.append(src)
 
-            # Округ через DaData (опционально)
+            # Округ (опционально)
             district_detected = None
             if DADATA_API_KEY:
                 district_detected = await get_district_by_address(address)
@@ -448,34 +510,26 @@ async def fetch_cian(districts, rooms, metros, owner_only):
     return results
 
 async def fetch_daily_by_metro(metro_stations=None):
-    """
-    Парсит свежие объявления (1 страница) и возвращает только те,
-    которые привязаны к указанным станциям метро.
-    Если metro_stations = None или пусто, возвращает все.
-    """
+    """Ежедневный парсинг по станциям метро (аналогично fetch_cian, но без фильтров)."""
     params = {
         'deal_type': 'sale',
         'engine_version': '2',
         'offer_type': 'flat',
         'region': '1',
         'only_flat': '1',
-        'owner': '1',  # для daily тоже можно искать только собственников? пока оставим всех
         'sort': 'creation_date_desc',
         'p': '1'
     }
     url = "https://www.cian.ru/cat.php"
-    logger.info(f"Ежедневный парсинг по метро: {url}")
-
-    html = await make_request(url, params=params)
+    html = await get_page_html(url, params)
     if not html:
         return []
 
     soup = BeautifulSoup(html, 'lxml')
-   # Поиск карточек аналогично основному парсеру
     cards = []
     selectors = [
         ('article', {'data-name': 'CardComponent'}),
-        ('div', {'class': '_93444fe79c--card--'}),  # исправлено
+        ('div', {'class': '_93444fe79c--card--'}),
         ('div', {'data-testid': 'offer-card'}),
         ('article', {'class': 'offer-card'}),
         ('div', {'class': 'catalog-offers'})
@@ -512,6 +566,7 @@ async def fetch_daily_by_metro(metro_stations=None):
             title_tag = card.find('h3')
             title = title_tag.text.strip() if title_tag else 'Квартира'
 
+            # Комнаты
             rooms_count = '?'
             room_match = re.search(r'(\d+)[-\s]комнат', title.lower())
             if room_match:
@@ -525,6 +580,7 @@ async def fetch_daily_by_metro(metro_stations=None):
                 elif 'студия' in title.lower() or 'студия' in chars_text.lower():
                     rooms_count = 'студия'
 
+            # Этаж, площадь
             chars = card.find_all('span', class_=re.compile('characteristic'))
             chars_text = ' '.join(c.text for c in chars)
             floor = '?/?'
@@ -607,7 +663,7 @@ async def background_parser(app: Application):
                 districts = filters.get('districts', [])
                 rooms = filters.get('rooms', [])
                 metros = filters.get('metros', [])
-                owner_only = filters.get('owner_only', False)  # по умолчанию False (все)
+                owner_only = filters.get('owner_only', False)
                 ads = await fetch_cian(districts, rooms, metros, owner_only)
                 if not ads:
                     continue
@@ -625,7 +681,7 @@ async def background_parser(app: Application):
                     metro_ok = True
                     if metros and ad['metro'] != 'Не указано':
                         metro_ok = ad['metro'] in metros
-                    # По комнатам уже отфильтровано в fetch_cian, но на всякий случай проверим
+                    # По комнатам уже отфильтровано в fetch_cian
                     room_ok = True
                     if rooms:
                         room_type = None
@@ -642,10 +698,10 @@ async def background_parser(app: Application):
                             room_type = '4-комнатная+'
                         room_ok = (room_type in rooms) if room_type else False
 
-                    # owner_only уже учтён в fetch_cian, но дополнительная проверка
+                    # owner_only уже учтён в fetch_cian
                     owner_ok = True
                     if owner_only:
-                        owner_ok = ad['owner']  # должно быть True, иначе не попало бы в ads
+                        owner_ok = ad['owner']
 
                     if (not districts and not metros and not rooms) or (district_ok and metro_ok and room_ok and owner_ok):
                         owner_text = "Собственник" if ad['owner'] else "Агент"
@@ -768,7 +824,7 @@ async def start_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['districts'] = []
     context.user_data['rooms'] = []
     context.user_data['metros'] = []
-    context.user_data['owner_only'] = False  # по умолчанию все
+    context.user_data['owner_only'] = False
     keyboard = [
         [InlineKeyboardButton("🏘 Выбрать округа", callback_data='f_districts')],
         [InlineKeyboardButton("🛏 Выбрать комнаты", callback_data='f_rooms')],
@@ -778,7 +834,6 @@ async def start_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await q.edit_message_text("⚙️ **Настройка фильтров**\nВыберите, что хотите настроить:", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- Выбор округов ---
 async def filter_districts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -807,7 +862,6 @@ async def toggle_district(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("« Назад", callback_data='f_back')])
     await q.edit_message_text("🏘 Выберите округа:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- Выбор комнат ---
 async def filter_rooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -836,7 +890,6 @@ async def toggle_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("« Назад", callback_data='f_back')])
     await q.edit_message_text("🛏 Выберите количество комнат:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- Выбор метро ---
 async def filter_metros(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -879,12 +932,10 @@ async def toggle_metro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("« Назад к веткам", callback_data='f_metros')])
     await q.edit_message_text(f"🚇 **{line['name']}**\nВыберите станции:", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- Выбор типа (собственник/все) ---
 async def filter_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     current = context.user_data.get('owner_only', False)
-    # current = False (все), True (только собственники)
     text = "👤 Выберите тип объявлений:\n"
     keyboard = [
         [InlineKeyboardButton("✅ Все (агенты и собственники)" if not current else "⬜ Все (агенты и собственники)", callback_data='owner_all')],
@@ -900,7 +951,6 @@ async def toggle_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['owner_only'] = False
     elif q.data == 'owner_only':
         context.user_data['owner_only'] = True
-    # Обновляем отображение
     current = context.user_data.get('owner_only', False)
     text = "👤 Выберите тип объявлений:\n"
     keyboard = [
@@ -910,13 +960,11 @@ async def toggle_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- Назад в меню фильтров ---
 async def filter_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await start_filter(update, context)
 
-# --- Завершение настройки и сохранение ---
 async def filters_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -940,7 +988,6 @@ async def filters_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"🚇 Метро: {', '.join(metros) if metros else 'все'}\n"
     text += f"👤 Тип: {'Только собственники' if owner_only else 'Все'}"
     await q.edit_message_text(text, parse_mode='Markdown')
-    # Возвращаем в главное меню
     keyboard = [
         [InlineKeyboardButton("💳 Подписаться", callback_data='cp')],
         [InlineKeyboardButton("ℹ️ Мой статус", callback_data='st')],
@@ -1077,7 +1124,7 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("Нет пользователей.")
         return
-    text = "**Пользователи (первые 20):**\n"
+    text = "**Список пользователей (первые 20):**\n"
     now = int(time.time())
     for user_id, until, plan in rows:
         if until and until > now:
@@ -1184,6 +1231,11 @@ async def test_parse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== ЗАПУСК ==========
 async def post_init(app: Application):
+    """Инициализация драйвера и запуск фоновой задачи."""
+    global driver
+    # Запускаем драйвер в отдельном потоке, чтобы не блокировать asyncio
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: asyncio.run(init_driver()))
     asyncio.create_task(background_parser(app))
 
 def main():
