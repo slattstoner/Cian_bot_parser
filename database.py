@@ -4,9 +4,10 @@ import time
 import logging
 from typing import Optional, List, Tuple, Any
 from datetime import datetime, timedelta
-from models import Ad, UserFilters
+from models import Ad
 
 logger = logging.getLogger(__name__)
+
 
 class Database:
     _pool: Optional[asyncpg.Pool] = None
@@ -26,10 +27,21 @@ class Database:
                     last_ad_id TEXT,
                     plan TEXT,
                     subscription_source TEXT DEFAULT NULL,
-                    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+                    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
                     banned BOOLEAN DEFAULT FALSE
                 )
             ''')
+            # Добавляем колонки если их нет (для существующих БД)
+            for col, definition in [
+                ('banned', 'BOOLEAN DEFAULT FALSE'),
+                ('subscription_source', 'TEXT DEFAULT NULL'),
+                ('role', "TEXT DEFAULT 'user'"),
+            ]:
+                try:
+                    await conn.execute(f'ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {definition}')
+                except Exception:
+                    pass
+
             # Таблица рефералов
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS referrals (
@@ -42,6 +54,11 @@ class Database:
                     currency VARCHAR(10) DEFAULT 'TON'
                 )
             ''')
+            try:
+                await conn.execute("ALTER TABLE referrals ADD COLUMN IF NOT EXISTS currency VARCHAR(10) DEFAULT 'TON'")
+            except Exception:
+                pass
+
             # Таблица платежей
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS payments (
@@ -54,10 +71,11 @@ class Database:
                     txid TEXT,
                     status TEXT DEFAULT 'pending',
                     source TEXT DEFAULT 'ton_manual',
-                    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+                    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
                     confirmed_at BIGINT
                 )
             ''')
+
             # Таблица тикетов
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS support_tickets (
@@ -69,6 +87,7 @@ class Database:
                     assigned_to BIGINT DEFAULT NULL
                 )
             ''')
+
             # Таблица сообщений тикетов
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS ticket_messages (
@@ -80,6 +99,7 @@ class Database:
                     created_at BIGINT
                 )
             ''')
+
             # Таблица модераторов
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS moderators (
@@ -89,7 +109,8 @@ class Database:
                     added_at BIGINT
                 )
             ''')
-            # Таблица объявлений (ЦИАН + Авито)
+
+            # Таблица объявлений
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS ads (
                     id SERIAL PRIMARY KEY,
@@ -105,13 +126,18 @@ class Database:
                     floor VARCHAR(20),
                     area VARCHAR(50),
                     owner BOOLEAN,
-                    district VARCHAR(10),
+                    district VARCHAR(50),
                     url TEXT,
                     photos JSONB,
                     published_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             ''')
+            try:
+                await conn.execute("ALTER TABLE ads ADD COLUMN IF NOT EXISTS price_value INTEGER DEFAULT 0")
+            except Exception:
+                pass
+
             # Таблица истории отправок
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS sent_ads (
@@ -122,7 +148,8 @@ class Database:
                     UNIQUE(user_id, ad_id)
                 )
             ''')
-            # Таблица балансов пользователей (для реферальных начислений)
+
+            # Таблица балансов
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS balances (
                     user_id BIGINT,
@@ -132,12 +159,13 @@ class Database:
                     PRIMARY KEY (user_id, currency)
                 )
             ''')
+
             # Индексы
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_ads_created ON ads(created_at)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_subscribed ON users(subscribed_until)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_payments_user_status ON payments(user_id, status)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_payments_txid ON payments(txid)')
-            
+
         logger.info("База данных инициализирована")
 
     @classmethod
@@ -146,9 +174,9 @@ class Database:
             await cls._pool.close()
             logger.info("Пул соединений закрыт")
 
-    # ========== Методы для пользователей ==========
+    # ========== Пользователи ==========
     @classmethod
-    async def get_user(cls, user_id: int) -> Optional[Tuple]:
+    async def get_user(cls, user_id: int) -> Optional[Any]:
         async with cls._pool.acquire() as conn:
             row = await conn.fetchrow(
                 'SELECT filters, subscribed_until, last_ad_id, plan, subscription_source, role, referrer_id FROM users WHERE user_id = $1',
@@ -184,7 +212,7 @@ class Database:
             await conn.execute('''
                 INSERT INTO users (user_id, filters) VALUES ($1, $2)
                 ON CONFLICT (user_id) DO UPDATE SET filters = EXCLUDED.filters
-            ''', user_id, json.dumps(filters_dict))
+            ''', user_id, json.dumps(filters_dict, ensure_ascii=False))
 
     @classmethod
     async def activate_subscription(cls, user_id: int, days: int, plan: str = None, source: str = 'grant'):
@@ -212,12 +240,16 @@ class Database:
     @classmethod
     async def get_referrals(cls, referrer_id: int):
         async with cls._pool.acquire() as conn:
-            rows = await conn.fetch('SELECT referred_id, created_at, commission_paid, payment_amount, currency FROM referrals WHERE referrer_id = $1', referrer_id)
+            rows = await conn.fetch(
+                'SELECT referred_id, created_at, commission_paid, payment_amount, currency FROM referrals WHERE referrer_id = $1',
+                referrer_id
+            )
             return rows
 
-    # ========== Методы для платежей ==========
+    # ========== Платежи ==========
     @classmethod
-    async def add_payment(cls, user_id: int, amount_ton: float = 0, amount_rub: int = 0, amount_stars: int = 0, plan: str = None, source: str = 'ton_manual'):
+    async def add_payment(cls, user_id: int, amount_ton: float = 0, amount_rub: int = 0,
+                          amount_stars: int = 0, plan: str = None, source: str = 'ton_manual'):
         async with cls._pool.acquire() as conn:
             return await conn.fetchval(
                 '''INSERT INTO payments (user_id, amount_ton, amount_rub, amount_stars, plan, source, status)
@@ -237,34 +269,44 @@ class Database:
     async def confirm_payment(cls, payment_id: int):
         async with cls._pool.acquire() as conn:
             await conn.execute(
-                'UPDATE payments SET status = $1, confirmed_at = EXTRACT(EPOCH FROM NOW()) WHERE id = $2',
-                'confirmed', payment_id
+                "UPDATE payments SET status = 'confirmed', confirmed_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1",
+                payment_id
             )
 
     # ========== Статистика ==========
     @classmethod
     async def get_stats(cls):
+        from config import PRICES_TON, PLAN_DAYS
         now = int(time.time())
         async with cls._pool.acquire() as conn:
             total = await conn.fetchval('SELECT COUNT(*) FROM users')
             active = await conn.fetchval('SELECT COUNT(*) FROM users WHERE subscribed_until > $1', now)
-            pending = await conn.fetchval('SELECT COUNT(*) FROM payments WHERE status = $1', 'pending')
-            total_income_ton = await conn.fetchval('SELECT COALESCE(SUM(amount_ton), 0) FROM payments WHERE status = $1', 'confirmed')
-            total_income_rub = await conn.fetchval('SELECT COALESCE(SUM(amount_rub), 0) FROM payments WHERE status = $1', 'confirmed')
-            total_income_stars = await conn.fetchval('SELECT COALESCE(SUM(amount_stars), 0) FROM payments WHERE status = $1', 'confirmed')
-            active_plans = await conn.fetch('SELECT plan, subscription_source FROM users WHERE subscribed_until > $1 AND plan IS NOT NULL', now)
+            pending = await conn.fetchval("SELECT COUNT(*) FROM payments WHERE status = 'pending'")
+            total_income_ton = await conn.fetchval(
+                "SELECT COALESCE(SUM(amount_ton), 0) FROM payments WHERE status = 'confirmed'")
+            total_income_rub = await conn.fetchval(
+                "SELECT COALESCE(SUM(amount_rub), 0) FROM payments WHERE status = 'confirmed'")
+            total_income_stars = await conn.fetchval(
+                "SELECT COALESCE(SUM(amount_stars), 0) FROM payments WHERE status = 'confirmed'")
+            active_plans = await conn.fetch(
+                'SELECT plan, subscription_source FROM users WHERE subscribed_until > $1 AND plan IS NOT NULL', now)
             monthly_ton = 0.0
-            for plan, source in active_plans:
+            for row in active_plans:
+                plan = row['plan']
                 if plan in PRICES_TON and plan in PLAN_DAYS:
                     monthly_ton += PRICES_TON[plan] / PLAN_DAYS[plan] * 30
-            open_tickets = await conn.fetchval('SELECT COUNT(*) FROM support_tickets WHERE status = $1', 'open')
+            open_tickets = await conn.fetchval("SELECT COUNT(*) FROM support_tickets WHERE status = 'open'")
             ads_count = await conn.fetchval('SELECT COUNT(*) FROM ads')
-            return total, active, pending, total_income_ton, total_income_rub, total_income_stars, monthly_ton, open_tickets, ads_count
+            return total, active, pending, float(total_income_ton), int(total_income_rub), int(
+                total_income_stars), monthly_ton, open_tickets, ads_count
 
     @classmethod
     async def get_all_users(cls, limit: int = 20, offset: int = 0):
         async with cls._pool.acquire() as conn:
-            return await conn.fetch('SELECT user_id, subscribed_until, plan, subscription_source FROM users ORDER BY user_id LIMIT $1 OFFSET $2', limit, offset)
+            return await conn.fetch(
+                'SELECT user_id, subscribed_until, plan, subscription_source FROM users ORDER BY user_id LIMIT $1 OFFSET $2',
+                limit, offset
+            )
 
     @classmethod
     async def get_active_subscribers(cls):
@@ -276,13 +318,10 @@ class Database:
     async def get_active_subscribers_detailed(cls):
         now = int(time.time())
         async with cls._pool.acquire() as conn:
-            rows = await conn.fetch('''
+            return await conn.fetch('''
                 SELECT user_id, subscribed_until, plan, subscription_source 
-                FROM users 
-                WHERE subscribed_until > $1 
-                ORDER BY subscribed_until DESC
+                FROM users WHERE subscribed_until > $1 ORDER BY subscribed_until DESC
             ''', now)
-            return rows
 
     # ========== Тикеты ==========
     @classmethod
@@ -305,35 +344,33 @@ class Database:
     @classmethod
     async def get_ticket_messages(cls, ticket_id: int):
         async with cls._pool.acquire() as conn:
-            rows = await conn.fetch('''
-                SELECT * FROM ticket_messages WHERE ticket_id = $1 ORDER BY created_at
-            ''', ticket_id)
-            return rows
+            return await conn.fetch(
+                'SELECT * FROM ticket_messages WHERE ticket_id = $1 ORDER BY created_at', ticket_id)
 
     @classmethod
     async def get_user_open_ticket(cls, user_id: int):
         async with cls._pool.acquire() as conn:
-            row = await conn.fetchrow('''
-                SELECT id FROM support_tickets WHERE user_id = $1 AND status = 'open'
-            ''', user_id)
+            row = await conn.fetchrow(
+                "SELECT id FROM support_tickets WHERE user_id = $1 AND status = 'open'", user_id)
             return row['id'] if row else None
 
     @classmethod
     async def get_open_tickets(cls):
         async with cls._pool.acquire() as conn:
-            return await conn.fetch('SELECT * FROM support_tickets WHERE status = $1 ORDER BY created_at', 'open')
+            return await conn.fetch("SELECT * FROM support_tickets WHERE status = 'open' ORDER BY created_at")
 
     @classmethod
     async def get_closed_tickets(cls, limit: int = 20, offset: int = 0):
         async with cls._pool.acquire() as conn:
-            return await conn.fetch('''
-                SELECT * FROM support_tickets WHERE status = 'closed' ORDER BY created_at DESC LIMIT $1 OFFSET $2
-            ''', limit, offset)
+            return await conn.fetch(
+                "SELECT * FROM support_tickets WHERE status = 'closed' ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                limit, offset
+            )
 
     @classmethod
     async def close_ticket(cls, ticket_id: int):
         async with cls._pool.acquire() as conn:
-            await conn.execute('UPDATE support_tickets SET status = $1 WHERE id = $2', 'closed', ticket_id)
+            await conn.execute("UPDATE support_tickets SET status = 'closed' WHERE id = $1", ticket_id)
 
     @classmethod
     async def assign_ticket(cls, ticket_id: int, moderator_id: int):
@@ -371,7 +408,7 @@ class Database:
         perms = await cls.is_moderator(user_id)
         return perms and perm in perms
 
-    # ========== Бан пользователей ==========
+    # ========== Бан ==========
     @classmethod
     async def ban_user(cls, user_id: int):
         async with cls._pool.acquire() as conn:
@@ -386,7 +423,12 @@ class Database:
     async def is_banned(cls, user_id: int) -> bool:
         async with cls._pool.acquire() as conn:
             row = await conn.fetchval('SELECT banned FROM users WHERE user_id = $1', user_id)
-            return row if row else False
+            return bool(row) if row is not None else False
+
+    @classmethod
+    async def get_banned_users(cls):
+        async with cls._pool.acquire() as conn:
+            return await conn.fetch('SELECT user_id FROM users WHERE banned = TRUE')
 
     # ========== Объявления ==========
     @classmethod
@@ -394,44 +436,23 @@ class Database:
         async with cls._pool.acquire() as conn:
             try:
                 result = await conn.execute('''
-                    INSERT INTO ads (ad_id, source, deal_type, title, price, price_value, address, metro, rooms, floor, area, owner, district, url, photos, published_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    INSERT INTO ads (ad_id, source, deal_type, title, price, price_value, address, metro,
+                                     rooms, floor, area, owner, district, url, photos, published_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
                     ON CONFLICT (ad_id) DO NOTHING
-                ''', ad.id, ad.source, ad.deal_type, ad.title, ad.price, ad.price_value, ad.address, ad.metro, ad.rooms,
-                   ad.floor, ad.area, ad.owner, ad.district_detected, ad.link, json.dumps(ad.photos), datetime.now())
+                ''', ad.id, ad.source, ad.deal_type, ad.title, ad.price, ad.price_value,
+                    ad.address, ad.metro, ad.rooms, ad.floor, ad.area, ad.owner,
+                    ad.district_detected, ad.link, json.dumps(ad.photos), datetime.now())
                 return 'INSERT 0 1' in result
             except Exception as e:
                 logger.error(f"Ошибка сохранения объявления {ad.id}: {e}")
                 return False
 
     @classmethod
-    async def save_ads_batch(cls, ads: List[Ad]) -> int:
-        if not ads:
-            return 0
-        async with cls._pool.acquire() as conn:
-            records = [(
-                ad.id, ad.source, ad.deal_type, ad.title, ad.price, ad.price_value,
-                ad.address, ad.metro, ad.rooms, ad.floor, ad.area, ad.owner,
-                ad.district_detected, ad.link, json.dumps(ad.photos), datetime.now()
-            ) for ad in ads]
-            try:
-                await conn.executemany('''
-                    INSERT INTO ads (ad_id, source, deal_type, title, price, price_value, address, metro, rooms, floor, area, owner, district, url, photos, published_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-                    ON CONFLICT (ad_id) DO NOTHING
-                ''', records)
-                return len(ads)
-            except Exception as e:
-                logger.error(f"Ошибка пакетного сохранения: {e}")
-                return 0
-
-    @classmethod
     async def was_ad_sent_to_user(cls, user_id: int, ad_id: str) -> bool:
         async with cls._pool.acquire() as conn:
             row = await conn.fetchrow(
-                'SELECT id FROM sent_ads WHERE user_id = $1 AND ad_id = $2',
-                user_id, ad_id
-            )
+                'SELECT id FROM sent_ads WHERE user_id = $1 AND ad_id = $2', user_id, ad_id)
             return row is not None
 
     @classmethod
@@ -450,22 +471,21 @@ class Database:
                 INSERT INTO balances (user_id, currency, amount)
                 VALUES ($1, $2, $3)
                 ON CONFLICT (user_id, currency)
-                DO UPDATE SET amount = balances.amount + EXCLUDED.amount,
-                              updated_at = NOW()
+                DO UPDATE SET amount = balances.amount + EXCLUDED.amount, updated_at = NOW()
             ''', user_id, currency, amount)
 
     @classmethod
     async def get_balance(cls, user_id: int, currency: str) -> float:
         async with cls._pool.acquire() as conn:
-            row = await conn.fetchval('SELECT amount FROM balances WHERE user_id=$1 AND currency=$2',
-                                       user_id, currency)
-            return row or 0.0
+            row = await conn.fetchval(
+                'SELECT amount FROM balances WHERE user_id=$1 AND currency=$2', user_id, currency)
+            return float(row) if row else 0.0
 
     @classmethod
     async def deduct_from_balance(cls, user_id: int, currency: str, amount: float):
         async with cls._pool.acquire() as conn:
             await conn.execute('''
-                UPDATE balances SET amount = amount - $1, updated_at=NOW()
+                UPDATE balances SET amount = amount - $1, updated_at = NOW()
                 WHERE user_id=$2 AND currency=$3 AND amount >= $1
             ''', amount, user_id, currency)
 
@@ -474,12 +494,21 @@ class Database:
         async with cls._pool.acquire() as conn:
             return await conn.fetch('SELECT * FROM balances ORDER BY user_id, currency')
 
-    # ========== Очистка старых объявлений ==========
+    @classmethod
+    async def set_balance(cls, user_id: int, currency: str, amount: float):
+        async with cls._pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO balances (user_id, currency, amount)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id, currency)
+                DO UPDATE SET amount = $3, updated_at = NOW()
+            ''', user_id, currency, amount)
+
+    # ========== Очистка ==========
     @classmethod
     async def cleanup_old_ads(cls, days: int = 30):
         async with cls._pool.acquire() as conn:
-            result = await conn.execute('''
-                DELETE FROM ads WHERE created_at < NOW() - $1::interval
-            ''', timedelta(days=days))
+            result = await conn.execute(
+                "DELETE FROM ads WHERE created_at < NOW() - $1::interval", timedelta(days=days))
             deleted = result.split()[-1] if result else "0"
             logger.info(f"Очистка БД: удалено {deleted} старых объявлений")
