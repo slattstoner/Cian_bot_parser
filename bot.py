@@ -4,7 +4,7 @@ import logging
 import signal
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, PreCheckoutQueryHandler, ConversationHandler
 
-from config import TOKEN, PAYMENT_PROVIDER_TOKEN
+from config import TOKEN, PAYMENT_PROVIDER_TOKEN, DATABASE_URL
 from database import Database
 from handlers import (
     start, role_chosen, main_menu, help_command, profile,
@@ -26,10 +26,9 @@ from handlers import (
     activate, grant, stats, users_list, find_user, profile_by_id,
     broadcast, test_parse, daily_by_metro, users_page, broadcast_confirm,
     add_mod_command, remove_mod_command, mods_list_command, debug_on_command, debug_off_command,
-    collector_loop, update_checker_loop
+    collector_loop, update_checker_loop, ROLE_SELECTION
 )
 from utils import shutdown
-from config import ROLE_SELECTION
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -37,8 +36,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Глобальный семафор для ограничения скорости отправки сообщений
+telegram_semaphore = asyncio.Semaphore(20)  # TELEGRAM_RATE_LIMIT
+
 async def post_init(app: Application):
-    await Database.init()
+    await Database.init(DATABASE_URL)
+    # Запуск фоновых задач
     asyncio.create_task(collector_loop(app))
     asyncio.create_task(update_checker_loop(app))
     app.bot_data['debug_mode'] = False
@@ -59,7 +62,7 @@ def main():
     app.add_handler(CommandHandler('menu', main_menu))
     app.add_handler(CommandHandler('admin', admin_panel))
     app.add_handler(CommandHandler('mod', mod_panel))
-    app.add_handler(CommandHandler('active_subs', admin_active_subs_callback))  # или отдельную функцию
+    app.add_handler(CommandHandler('active_subs', admin_active_subs_callback))
     app.add_handler(CommandHandler('add_mod', add_mod_command))
     app.add_handler(CommandHandler('remove_mod', remove_mod_command))
     app.add_handler(CommandHandler('mods', mods_list_command))
