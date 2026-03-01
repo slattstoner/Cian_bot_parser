@@ -2174,3 +2174,4 @@ async def update_checker_loop(app: Application):
             logger.error(f"Ошибка в цикле обновлений: {e}")
         
         await asyncio.sleep(AUTO_UPDATE_CHECK_INTERVAL)
+        
