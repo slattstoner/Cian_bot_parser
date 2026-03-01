@@ -2084,18 +2084,21 @@ async def send_ad_to_user(bot, user_id: int, ad: Ad, telegram_semaphore):
         source_icon = "🏢" if ad.source == 'cian' else "📱"
         source_name = "ЦИАН" if ad.source == 'cian' else "Авито"
 
-        # Используем обычный Markdown, без экранирования (v1)
-        text = (
-            f"🔵 *Новое объявление* ({source_icon} {source_name})\n"
-            f"🏷 {ad.title}\n"
-            f"💰 {ad.price}\n"
-            f"📍 {ad.address}\n"
-            f"🚇 {ad.metro}\n"
-            f"🏢 Этаж: {ad.floor}\n"
-            f"📏 {ad.area}\n"
-            f"🛏 Комнат: {ad.rooms}\n"
-            f"{owner_text} | {deal_text}\n"
-        )
+      # Формируем красивое сообщение
+header = f"🏠 *Новое объявление* от {source_icon} {source_name}\n"
+details = (
+    f"💰 *Цена:* {ad.price}\n"
+    f"📍 *Адрес:* {ad.address}\n"
+    f"🚇 *Метро:* {ad.metro}\n"
+    f"🏢 *Этаж:* {ad.floor}\n"
+    f"📏 *Площадь:* {ad.area}\n"
+    f"🛏 *Комнат:* {ad.rooms}\n"
+    f"👤 *Тип:* {owner_text} | {deal_text}\n"
+)
+footer = f"\n[🔗 Открыть объявление]({ad.link})"
+
+text = header + details + footer
+        
 
         try:
             if ad.photos and len(ad.photos) > 0:
