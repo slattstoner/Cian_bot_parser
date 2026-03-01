@@ -26,7 +26,8 @@ class Database:
                     last_ad_id TEXT,
                     plan TEXT,
                     subscription_source TEXT DEFAULT NULL,
-                    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())
+                    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+                    banned BOOLEAN DEFAULT FALSE
                 )
             ''')
             # Таблица рефералов
@@ -66,6 +67,17 @@ class Database:
                     created_at BIGINT,
                     status TEXT DEFAULT 'open',
                     assigned_to BIGINT DEFAULT NULL
+                )
+            ''')
+            # Таблица сообщений тикетов
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS ticket_messages (
+                    id SERIAL PRIMARY KEY,
+                    ticket_id INTEGER REFERENCES support_tickets(id) ON DELETE CASCADE,
+                    user_id BIGINT,
+                    message TEXT,
+                    is_from_mod BOOLEAN DEFAULT FALSE,
+                    created_at BIGINT
                 )
             ''')
             # Таблица модераторов
@@ -283,9 +295,40 @@ class Database:
             )
 
     @classmethod
+    async def add_ticket_message(cls, ticket_id: int, user_id: int, message: str, is_from_mod: bool = False):
+        async with cls._pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO ticket_messages (ticket_id, user_id, message, is_from_mod, created_at)
+                VALUES ($1, $2, $3, $4, $5)
+            ''', ticket_id, user_id, message, is_from_mod, int(time.time()))
+
+    @classmethod
+    async def get_ticket_messages(cls, ticket_id: int):
+        async with cls._pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT * FROM ticket_messages WHERE ticket_id = $1 ORDER BY created_at
+            ''', ticket_id)
+            return rows
+
+    @classmethod
+    async def get_user_open_ticket(cls, user_id: int):
+        async with cls._pool.acquire() as conn:
+            row = await conn.fetchrow('''
+                SELECT id FROM support_tickets WHERE user_id = $1 AND status = 'open'
+            ''', user_id)
+            return row['id'] if row else None
+
+    @classmethod
     async def get_open_tickets(cls):
         async with cls._pool.acquire() as conn:
             return await conn.fetch('SELECT * FROM support_tickets WHERE status = $1 ORDER BY created_at', 'open')
+
+    @classmethod
+    async def get_closed_tickets(cls, limit: int = 20, offset: int = 0):
+        async with cls._pool.acquire() as conn:
+            return await conn.fetch('''
+                SELECT * FROM support_tickets WHERE status = 'closed' ORDER BY created_at DESC LIMIT $1 OFFSET $2
+            ''', limit, offset)
 
     @classmethod
     async def close_ticket(cls, ticket_id: int):
@@ -327,6 +370,23 @@ class Database:
     async def has_permission(cls, user_id: int, perm: str):
         perms = await cls.is_moderator(user_id)
         return perms and perm in perms
+
+    # ========== Бан пользователей ==========
+    @classmethod
+    async def ban_user(cls, user_id: int):
+        async with cls._pool.acquire() as conn:
+            await conn.execute('UPDATE users SET banned = TRUE WHERE user_id = $1', user_id)
+
+    @classmethod
+    async def unban_user(cls, user_id: int):
+        async with cls._pool.acquire() as conn:
+            await conn.execute('UPDATE users SET banned = FALSE WHERE user_id = $1', user_id)
+
+    @classmethod
+    async def is_banned(cls, user_id: int) -> bool:
+        async with cls._pool.acquire() as conn:
+            row = await conn.fetchval('SELECT banned FROM users WHERE user_id = $1', user_id)
+            return row if row else False
 
     # ========== Объявления ==========
     @classmethod
@@ -421,6 +481,5 @@ class Database:
             result = await conn.execute('''
                 DELETE FROM ads WHERE created_at < NOW() - $1::interval
             ''', timedelta(days=days))
-            # result имеет формат "DELETE <count>"
             deleted = result.split()[-1] if result else "0"
             logger.info(f"Очистка БД: удалено {deleted} старых объявлений")
