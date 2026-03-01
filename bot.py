@@ -141,10 +141,10 @@ def main():
 
     # ===== Подписка =====
     app.add_handler(CallbackQueryHandler(choose_plan, pattern='^cp$'))
-    app.add_handler(CallbackQueryHandler(plan_chosen, pattern='^p\d+m$'))
+    app.add_handler(CallbackQueryHandler(plan_chosen, pattern='^p\\d+m$'))
     app.add_handler(CallbackQueryHandler(pay_stars, pattern='^pay_stars$'))
     app.add_handler(CallbackQueryHandler(pay_ton, pattern='^pay_ton$'))
-    app.add_handler(CallbackQueryHandler(pay_rub, pattern='^pay_rub$'))  # ← должно быть
+    app.add_handler(CallbackQueryHandler(pay_rub, pattern='^pay_rub$'))
     app.add_handler(CallbackQueryHandler(pay_balance, pattern='^pay_balance$'))
     app.add_handler(CallbackQueryHandler(balance_pay_confirm, pattern='^balpay_'))
 
@@ -161,12 +161,12 @@ def main():
     app.add_handler(CallbackQueryHandler(toggle_district, pattern='^d_.+$'))
     app.add_handler(CallbackQueryHandler(toggle_room, pattern='^r_.+$'))
     app.add_handler(CallbackQueryHandler(metro_line, pattern='^l_.+$'))
-    app.add_handler(CallbackQueryHandler(toggle_metro, pattern='^m_[A-Za-z0-9]+_\d+$'))
+    app.add_handler(CallbackQueryHandler(toggle_metro, pattern='^m_[A-Za-z0-9]+_\\d+$'))
     app.add_handler(CallbackQueryHandler(metro_clear, pattern='^metro_clear$'))
     app.add_handler(CallbackQueryHandler(toggle_source, pattern='^src_'))
     app.add_handler(CallbackQueryHandler(toggle_owner, pattern='^owner_'))
     app.add_handler(CallbackQueryHandler(toggle_deal_type, pattern='^deal_'))
-    app.add_handler(CallbackQueryHandler(toggle_metro_search, pattern='^ms_\d+$'))
+    app.add_handler(CallbackQueryHandler(toggle_metro_search, pattern='^ms_\\d+$'))
 
     # ===== Платежи =====
     if PAYMENT_PROVIDER_TOKEN:
