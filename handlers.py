@@ -4,6 +4,8 @@ import asyncio
 import time
 import re
 import sys
+import csv
+import io
 from datetime import datetime
 from typing import List, Dict, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, LabeledPrice
@@ -26,13 +28,54 @@ logger = logging.getLogger(__name__)
 # Состояния для ConversationHandler
 ROLE_SELECTION = 0
 
-# Глобальный семафор для ограничения скорости отправки (импортируется из bot.py)
-# from bot import telegram_semaphore
+# Глобальные словари для метро (поиск по индексу)
+STATION_TO_INDEX = {station: idx for idx, station in enumerate(ALL_METRO_STATIONS)}
+INDEX_TO_STATION = {idx: station for station, idx in STATION_TO_INDEX.items()}
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+async def notify_moderators(bot, text: str):
+    """Уведомляет всех модераторов с правом view_tickets"""
+    await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode='Markdown')
+    mods = await Database.get_moderators()
+    for mod in mods:
+        if await Database.has_permission(mod['user_id'], 'view_tickets'):
+            try:
+                await bot.send_message(chat_id=mod['user_id'], text=text, parse_mode='Markdown')
+            except:
+                pass
+
+async def handle_referral_commission(referred_user_id: int, plan: str, currency: str, amount_paid: float, bot):
+    """Начисляет комиссию рефереру"""
+    user = await Database.get_user(referred_user_id)
+    if not user or not user[6]:
+        return
+    referrer_id = user[6]
+    commission = amount_paid * (REFERRAL_COMMISSION / 100)
+
+    async with Database._pool.acquire() as conn:
+        await conn.execute('''
+            UPDATE referrals SET commission_paid=TRUE, payment_amount=$1, currency=$3
+            WHERE referred_id=$2
+        ''', commission, referred_user_id, currency)
+    
+    await Database.add_to_balance(referrer_id, currency, commission)
+
+    try:
+        await bot.send_message(
+            chat_id=referrer_id,
+            text=f"💰 Вам начислена комиссия {commission:.2f} {currency} за подписку реферала (ID {referred_user_id})."
+        )
+    except Exception as e:
+        logger.error(f"Ошибка уведомления реферера {referrer_id}: {e}")
 
 # ========== ГЛАВНОЕ МЕНЮ И СТАРТ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start с маркетинговым текстом и выбором роли"""
     user_id = update.effective_user.id
+    if await Database.is_banned(user_id):
+        await update.message.reply_text("⛔ Вы забанены. Обратитесь в поддержку.")
+        return ConversationHandler.END
+
     await Database.create_user(user_id)
     
     # Парсинг реферального параметра
@@ -85,7 +128,7 @@ async def role_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     user_id = q.from_user.id
-    role = q.data.split('_')[1]  # agent или owner
+    role = q.data.split('_')[1]
 
     await Database.set_user_role(user_id, role)
 
@@ -119,6 +162,10 @@ async def role_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главное меню бота"""
     user_id = update.effective_user.id
+    if await Database.is_banned(user_id):
+        await update.effective_message.reply_text("⛔ Вы забанены.")
+        return
+
     user = await Database.get_user(user_id)
     role = user[5] if user else 'user'
 
@@ -130,7 +177,6 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❓ Помощь", callback_data='help')]
     ]
     
-    # Если админ, добавим кнопку админки
     if user_id == ADMIN_ID:
         keyboard.append([InlineKeyboardButton("👑 Админ-панель", callback_data='admin_panel')])
     else:
@@ -164,13 +210,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "/mod – панель модератора\n"
         text += "/tickets – список открытых тикетов\n"
         text += "/reply <id> <текст> – ответить пользователю\n"
-        text += "/close_ticket <id> – закрыть тикет\n\n"
+        text += "/close_ticket <id> – закрыть тикет\n"
+        text += "/view_ticket <id> – история переписки по тикету\n\n"
     
     if is_admin:
         text += (
             "👑 *Команды администратора:*\n"
             "/admin – панель администратора\n"
-            "/act <payment_id> – активировать подписку по TON (после проверки TXID)\n"
+            "/act <payment_id> – активировать подписку по TON\n"
             "/grant <id> <days> [plan] – выдать подписку\n"
             "/stats – статистика\n"
             "/users [offset] – список пользователей\n"
@@ -179,7 +226,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/tickets – открытые тикеты\n"
             "/close_ticket <id> – закрыть тикет\n"
             "/reply <id> <текст> – ответить пользователю\n"
-            "/broadcast – массовая рассылка\n"
+            "/broadcast – массовая рассылка клиентам\n"
+            "/broadcast_mods – рассылка модераторам\n"
             "/testparse – тест парсинга\n"
             "/daily <станции> – поиск за сутки по метро\n"
             "/active_subs – активные подписчики\n"
@@ -189,6 +237,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/debug_on – включить автообновление\n"
             "/debug_off – выключить автообновление\n"
             "/pay <payment_id> <txid> – для пользователей (ручная оплата TON)\n"
+            "/ban <id> – забанить пользователя\n"
+            "/unban <id> – разбанить\n"
+            "/set_balance <id> <currency> <amount> – установить баланс\n"
+            "/add_balance <id> <currency> <amount> – добавить на баланс\n"
+            "/export_users – экспорт пользователей в CSV\n"
         )
     
     keyboard = [[InlineKeyboardButton("🏠 Главное меню", callback_data='main_menu')]]
@@ -294,6 +347,7 @@ async def plan_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💎 Telegram Stars", callback_data='pay_stars')],
         [InlineKeyboardButton("💰 TON (криптовалюта)", callback_data='pay_ton')],
         [InlineKeyboardButton("💳 Банковская карта (рубли)", callback_data='pay_rub')],
+        [InlineKeyboardButton("💰 Оплатить с баланса", callback_data='pay_balance')],
         [InlineKeyboardButton("« Назад", callback_data='cp')]
     ]
     await q.edit_message_text(f"Выберите способ оплаты для тарифа {plan}:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -432,6 +486,65 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=f"Пользователь {user_id} отправил TXID для платежа #{payment_id}: {txid}"
     )
 
+# ---------- ОПЛАТА С БАЛАНСА ----------
+async def pay_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Оплата подписки с внутреннего баланса"""
+    q = update.callback_query
+    await q.answer()
+    user_id = q.from_user.id
+    plan = context.user_data.get('plan', '1m')
+    days = PLAN_DAYS[plan]
+    
+    balances = {
+        'TON': await Database.get_balance(user_id, 'TON'),
+        'STARS': await Database.get_balance(user_id, 'STARS'),
+        'RUB': await Database.get_balance(user_id, 'RUB')
+    }
+    required = {
+        'TON': PRICES_TON[plan],
+        'STARS': PRICES_STARS[plan],
+        'RUB': PRICES_RUB[plan]
+    }
+    
+    available = [(curr, required[curr]) for curr in ['TON', 'STARS', 'RUB'] if balances[curr] >= required[curr]]
+    
+    if not available:
+        await q.edit_message_text("❌ Недостаточно средств на балансе.")
+        return
+    
+    if len(available) == 1:
+        currency, amount = available[0]
+        await Database.deduct_from_balance(user_id, currency, amount)
+        await Database.activate_subscription(user_id, days, plan, source=f'balance_{currency}')
+        await handle_referral_commission(user_id, plan, currency, amount, context.bot)
+        await q.edit_message_text(f"✅ Подписка активирована! Списано {amount} {currency}.")
+    else:
+        keyboard = []
+        for currency, amount in available:
+            keyboard.append([InlineKeyboardButton(f"{currency} ({amount})", callback_data=f'balance_pay_{currency}_{plan}')])
+        keyboard.append([InlineKeyboardButton("« Назад", callback_data='cp')])
+        await q.edit_message_text("Выберите валюту для оплаты:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def balance_pay_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data.split('_')
+    currency = data[2]
+    plan = data[3]
+    days = PLAN_DAYS[plan]
+    user_id = q.from_user.id
+    amount = {'TON': PRICES_TON[plan], 'STARS': PRICES_STARS[plan], 'RUB': PRICES_RUB[plan]}[currency]
+    
+    balance = await Database.get_balance(user_id, currency)
+    if balance < amount:
+        await q.edit_message_text("❌ Недостаточно средств. Пополните баланс.")
+        return
+    
+    await Database.deduct_from_balance(user_id, currency, amount)
+    await Database.activate_subscription(user_id, days, plan, source=f'balance_{currency}')
+    await handle_referral_commission(user_id, plan, currency, amount, context.bot)
+    await q.edit_message_text(f"✅ Подписка активирована! Списано {amount} {currency}.")
+
 # ---------- ФИЛЬТРЫ ----------
 async def start_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало настройки фильтров"""
@@ -541,6 +654,7 @@ async def filter_metros(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("🚇 Выберите ветку метро или найдите по названию:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def metro_line(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает станции выбранной линии (с использованием индексов)"""
     q = update.callback_query
     await q.answer()
     line_code = q.data[2:]
@@ -549,9 +663,10 @@ async def metro_line(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected = context.user_data.get('metros', [])
     
     keyboard = []
-    for s in line['stations']:
-        mark = "✅" if s in selected else "⬜"
-        keyboard.append([InlineKeyboardButton(f"{mark} {s}", callback_data=f'm_{s}')])
+    for idx, station in enumerate(line['stations']):
+        mark = "✅" if station in selected else "⬜"
+        callback_data = f"m_{line_code}_{idx}"
+        keyboard.append([InlineKeyboardButton(f"{mark} {station}", callback_data=callback_data)])
     keyboard.append([InlineKeyboardButton("« Назад к веткам", callback_data='f_metros')])
     
     await q.edit_message_text(
@@ -561,24 +676,26 @@ async def metro_line(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def toggle_metro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключает станцию по индексу"""
     q = update.callback_query
     await q.answer()
-    station = q.data[2:]
-    selected = context.user_data.get('metros', [])
+    data = q.data.split('_')
+    line_code = data[1]
+    idx = int(data[2])
+    line = METRO_LINES[line_code]
+    station = line['stations'][idx]
     
+    selected = context.user_data.get('metros', [])
     if station in selected:
         selected.remove(station)
     else:
         selected.append(station)
     context.user_data['metros'] = selected
     
-    line_code = context.user_data['cur_line']
-    line = METRO_LINES[line_code]
-    
     keyboard = []
-    for s in line['stations']:
+    for i, s in enumerate(line['stations']):
         mark = "✅" if s in selected else "⬜"
-        keyboard.append([InlineKeyboardButton(f"{mark} {s}", callback_data=f'm_{s}')])
+        keyboard.append([InlineKeyboardButton(f"{mark} {s}", callback_data=f"m_{line_code}_{i}")])
     keyboard.append([InlineKeyboardButton("« Назад к веткам", callback_data='f_metros')])
     
     await q.edit_message_text(
@@ -594,6 +711,7 @@ async def metro_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data['awaiting_metro_search'] = True
 
 async def handle_metro_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстового поиска метро"""
     if not context.user_data.get('awaiting_metro_search'):
         return
     
@@ -609,11 +727,35 @@ async def handle_metro_search_text(update: Update, context: ContextTypes.DEFAULT
     
     keyboard = []
     for station in found[:10]:
-        keyboard.append([InlineKeyboardButton(station, callback_data=f'm_{station}')])
+        # Используем глобальный индекс для callback
+        global_idx = STATION_TO_INDEX[station]
+        keyboard.append([InlineKeyboardButton(station, callback_data=f"ms_{global_idx}")])
     keyboard.append([InlineKeyboardButton("« Отмена", callback_data='f_metros')])
     
     await update.message.reply_text("Найдено станций. Выберите:", reply_markup=InlineKeyboardMarkup(keyboard))
     context.user_data['awaiting_metro_search'] = False
+
+async def toggle_metro_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора станции из результатов поиска"""
+    q = update.callback_query
+    await q.answer()
+    global_idx = int(q.data.split('_')[1])
+    station = INDEX_TO_STATION[global_idx]
+    
+    selected = context.user_data.get('metros', [])
+    if station in selected:
+        selected.remove(station)
+    else:
+        selected.append(station)
+    context.user_data['metros'] = selected
+    
+    await q.edit_message_text(
+        f"✅ Станция {station} добавлена в фильтр.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 Продолжить поиск", callback_data='metro_search')],
+            [InlineKeyboardButton("« К веткам метро", callback_data='f_metros')]
+        ])
+    )
 
 async def filter_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -765,37 +907,42 @@ async def support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['awaiting_support'] = True
 
 async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('awaiting_support'):
+    """Обработка входящих сообщений в поддержку"""
+    if context.user_data.get('awaiting_metro_search') or context.user_data.get('awaiting_mod_user_id'):
         return
     
     user_id = update.effective_user.id
     message_text = update.message.text
-    ticket_id = await Database.create_ticket(user_id, message_text)
-    user = update.effective_user
     
-    forward_text = (
-        f"🆘 *Новое обращение в поддержку*\n"
-        f"От: {user.full_name} (@{user.username})\n"
-        f"ID: `{user_id}`\n"
-        f"Тикет #{ticket_id}\n\n"
-        f"*Сообщение:*\n{message_text}"
-    )
-    
-    await context.bot.send_message(chat_id=ADMIN_ID, text=forward_text, parse_mode='Markdown')
-    
-    mods = await Database.get_moderators()
-    for mod in mods:
-        if await Database.has_permission(mod['user_id'], 'view_tickets'):
-            try:
-                await context.bot.send_message(chat_id=mod['user_id'], text=forward_text, parse_mode='Markdown')
-            except:
-                pass
-    
-    await update.message.reply_text("✅ Ваше сообщение отправлено модератору. Ожидайте ответа.")
-    context.user_data['awaiting_support'] = False
-    await main_menu(update, context)
+    # Проверяем, есть ли уже открытый тикет у пользователя
+    ticket_id = await Database.get_user_open_ticket(user_id)
+    if ticket_id:
+        # Добавляем сообщение в существующий тикет
+        await Database.add_ticket_message(ticket_id, user_id, message_text, is_from_mod=False)
+        forward_text = (
+            f"💬 *Новое сообщение по тикету #{ticket_id}*\n"
+            f"От: {update.effective_user.full_name} (@{update.effective_user.username})\n"
+            f"ID: `{user_id}`\n\n"
+            f"*Сообщение:*\n{message_text}"
+        )
+        await notify_moderators(context.bot, forward_text)
+        await update.message.reply_text("✅ Ваше сообщение отправлено модератору.")
+    else:
+        # Создаём новый тикет
+        ticket_id = await Database.create_ticket(user_id, message_text)
+        await Database.add_ticket_message(ticket_id, user_id, message_text, is_from_mod=False)
+        forward_text = (
+            f"🆘 *Новое обращение в поддержку*\n"
+            f"От: {update.effective_user.full_name} (@{update.effective_user.username})\n"
+            f"ID: `{user_id}`\n"
+            f"Тикет #{ticket_id}\n\n"
+            f"*Сообщение:*\n{message_text}"
+        )
+        await notify_moderators(context.bot, forward_text)
+        await update.message.reply_text("✅ Ваше сообщение отправлено модератору. Ожидайте ответа.")
 
 async def tickets_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список открытых тикетов"""
     user_id = update.effective_user.id
     if user_id != ADMIN_ID and not await Database.has_permission(user_id, 'view_tickets'):
         await update.message.reply_text("⛔ У вас нет прав на эту команду.")
@@ -826,6 +973,7 @@ async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /close_ticket id")
 
 async def admin_reply_to_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ответить пользователю по тикету (сохраняется история)"""
     user_id = update.effective_user.id
     if user_id != ADMIN_ID and not await Database.has_permission(user_id, 'view_tickets'):
         await update.message.reply_text("⛔ У вас нет прав на эту команду.")
@@ -840,6 +988,14 @@ async def admin_reply_to_ticket(update: Update, context: ContextTypes.DEFAULT_TY
         target_user_id = int(parts[1])
         reply_text = parts[2]
         
+        # Находим открытый тикет этого пользователя
+        ticket_id = await Database.get_user_open_ticket(target_user_id)
+        if not ticket_id:
+            # Если нет открытого, создаём новый
+            ticket_id = await Database.create_ticket(target_user_id, "Ответ модератора (новый тикет)")
+        
+        await Database.add_ticket_message(ticket_id, user_id, reply_text, is_from_mod=True)
+        
         await context.bot.send_message(
             chat_id=target_user_id,
             text=f"📬 *Ответ модератора:*\n{reply_text}",
@@ -848,6 +1004,28 @@ async def admin_reply_to_ticket(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"✅ Ответ отправлен пользователю {target_user_id}")
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
+
+async def view_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр истории тикета"""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID and not await Database.has_permission(user_id, 'view_tickets'):
+        await update.message.reply_text("⛔ Нет прав.")
+        return
+    try:
+        ticket_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Использование: /view_ticket <id>")
+        return
+    messages = await Database.get_ticket_messages(ticket_id)
+    if not messages:
+        await update.message.reply_text("Тикет не найден.")
+        return
+    text = f"📋 *История тикета #{ticket_id}*\n\n"
+    for msg in messages:
+        sender = "Модератор" if msg['is_from_mod'] else f"Пользователь {msg['user_id']}"
+        time_str = datetime.fromtimestamp(msg['created_at']).strftime('%d.%m %H:%M')
+        text += f"[{time_str}] {sender}: {msg['message'][:100]}...\n"
+    await update.message.reply_text(text, parse_mode='Markdown')
 
 # ---------- МОДЕРАТОРСКАЯ ПАНЕЛЬ ----------
 async def mod_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -863,6 +1041,7 @@ async def mod_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     if 'view_tickets' in perms:
         keyboard.append([InlineKeyboardButton("🆘 Открытые тикеты", callback_data='mod_tickets')])
+        keyboard.append([InlineKeyboardButton("📋 Закрытые тикеты", callback_data='mod_closed_tickets')])
     if 'view_stats' in perms:
         keyboard.append([InlineKeyboardButton("📊 Статистика", callback_data='mod_stats')])
     keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data='main_menu')])
@@ -896,6 +1075,24 @@ async def mod_tickets_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         for t in tickets:
             text += f"#{t['id']} от `{t['user_id']}`: {t['message'][:50]}...\n"
     
+    await q.edit_message_text(text, parse_mode='Markdown')
+    keyboard = [[InlineKeyboardButton("« Назад", callback_data='mod_panel_back')]]
+    await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def mod_closed_tickets_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await Database.has_permission(user_id, 'view_tickets'):
+        return
+    q = update.callback_query
+    await q.answer()
+    tickets = await Database.get_closed_tickets(limit=20, offset=0)
+    if not tickets:
+        text = "Нет закрытых тикетов."
+    else:
+        text = "📋 *Последние закрытые тикеты:*\n\n"
+        for t in tickets:
+            time_str = datetime.fromtimestamp(t['created_at']).strftime('%d.%m %H:%M')
+            text += f"#{t['id']} от `{t['user_id']}` ({time_str})\n"
     await q.edit_message_text(text, parse_mode='Markdown')
     keyboard = [[InlineKeyboardButton("« Назад", callback_data='mod_panel_back')]]
     await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
@@ -950,7 +1147,9 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats')],
         [InlineKeyboardButton("👥 Список пользователей", callback_data='admin_users_0')],
         [InlineKeyboardButton("🆘 Открытые тикеты", callback_data='admin_tickets')],
-        [InlineKeyboardButton("📢 Сделать рассылку", callback_data='admin_broadcast')],
+        [InlineKeyboardButton("📋 Закрытые тикеты", callback_data='admin_closed_tickets')],
+        [InlineKeyboardButton("📢 Рассылка клиентам", callback_data='admin_broadcast')],
+        [InlineKeyboardButton("📢 Рассылка модераторам", callback_data='admin_broadcast_mods')],
         [InlineKeyboardButton("🔍 Поиск пользователя", callback_data='admin_find')],
         [InlineKeyboardButton("👥 Активные подписчики", callback_data='admin_active_subs')],
         [InlineKeyboardButton("➕ Добавить модератора", callback_data='admin_add_mod')],
@@ -958,6 +1157,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📋 Список модераторов", callback_data='admin_list_mods')],
         [InlineKeyboardButton("⚙️ Режим отладки", callback_data='admin_debug')],
         [InlineKeyboardButton("💰 Балансы пользователей", callback_data='admin_balances')],
+        [InlineKeyboardButton("🚫 Заблокированные", callback_data='admin_banned')],
+        [InlineKeyboardButton("📤 Экспорт пользователей", callback_data='admin_export')],
         [InlineKeyboardButton("🏠 Главное меню", callback_data='main_menu')]
     ]
     
@@ -1051,6 +1252,23 @@ async def admin_tickets_callback(update: Update, context: ContextTypes.DEFAULT_T
     keyboard = [[InlineKeyboardButton("« Назад в админку", callback_data='admin_panel_back')]]
     await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
 
+async def admin_closed_tickets_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    q = update.callback_query
+    await q.answer()
+    tickets = await Database.get_closed_tickets(limit=20, offset=0)
+    if not tickets:
+        text = "Нет закрытых тикетов."
+    else:
+        text = "📋 *Закрытые тикеты:*\n\n"
+        for t in tickets:
+            time_str = datetime.fromtimestamp(t['created_at']).strftime('%d.%m %H:%M')
+            text += f"#{t['id']} от `{t['user_id']}` ({time_str})\n"
+    await q.edit_message_text(text, parse_mode='Markdown')
+    keyboard = [[InlineKeyboardButton("« Назад в админку", callback_data='admin_panel_back')]]
+    await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def admin_broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -1058,7 +1276,18 @@ async def admin_broadcast_callback(update: Update, context: ContextTypes.DEFAULT
     await q.answer()
     
     await q.edit_message_text(
-        "Используйте команду /broadcast <текст> для рассылки.\n\nНапример: /broadcast Всем привет!",
+        "Используйте команду /broadcast <текст> для рассылки клиентам.\n\nНапример: /broadcast Всем привет!",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='admin_panel_back')]])
+    )
+
+async def admin_broadcast_mods_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    q = update.callback_query
+    await q.answer()
+    
+    await q.edit_message_text(
+        "Используйте команду /broadcast_mods <текст> для рассылки модераторам.\n\nНапример: /broadcast_mods Всем модераторам!",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='admin_panel_back')]])
     )
 
@@ -1122,6 +1351,26 @@ async def admin_handle_add_mod(update: Update, context: ContextTypes.DEFAULT_TYP
         
         perms = ['view_tickets', 'view_stats']
         await Database.add_moderator(user_id, perms, ADMIN_ID)
+        
+        # Уведомляем нового модератора
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "🎉 *Поздравляем! Вы стали модератором.*\n\n"
+                    "Теперь вам доступны следующие команды:\n"
+                    "• `/mod` – панель модератора\n"
+                    "• `/tickets` – список открытых тикетов\n"
+                    "• `/reply <id> <текст>` – ответить пользователю\n"
+                    "• `/close_ticket <id>` – закрыть тикет\n"
+                    "• `/view_ticket <id>` – история переписки по тикету\n\n"
+                    "Пожалуйста, используйте свои права ответственно."
+                ),
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Не удалось уведомить нового модератора {user_id}: {e}")
+
         await update.message.reply_text(f"✅ Пользователь {user_id} добавлен как модератор с правами: {perms}")
         context.user_data.pop('awaiting_mod_user_id', None)
         await admin_panel(update, context)
@@ -1236,289 +1485,33 @@ async def admin_balances_callback(update: Update, context: ContextTypes.DEFAULT_
     keyboard = [[InlineKeyboardButton("« Назад в админку", callback_data='admin_panel_back')]]
     await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
 
+async def admin_banned_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    q = update.callback_query
+    await q.answer()
+    # Заглушка – можно реализовать позже
+    await q.edit_message_text(
+        "Функция просмотра забаненных пользователей в разработке.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='admin_panel_back')]])
+    )
+
+async def admin_export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "Используйте команду /export_users для выгрузки пользователей в CSV.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='admin_panel_back')]])
+    )
+
 async def admin_panel_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Возврат в админ-панель"""
     if update.effective_user.id != ADMIN_ID:
         return
     context.user_data.pop('awaiting_mod_user_id', None)
     await admin_panel(update, context)
-
-# ---------- РЕФЕРАЛЬНАЯ КОМИССИЯ ----------
-async def handle_referral_commission(referred_user_id: int, plan: str, currency: str, amount_paid: float, bot):
-    """Начисляет комиссию рефереру, если он есть"""
-    user = await Database.get_user(referred_user_id)
-    if not user or not user[6]:  # referrer_id
-        return
-    referrer_id = user[6]
-    commission = amount_paid * (REFERRAL_COMMISSION / 100)
-
-    async with Database._pool.acquire() as conn:
-        await conn.execute('''
-            UPDATE referrals SET commission_paid=TRUE, payment_amount=$1, currency=$3
-            WHERE referred_id=$2
-        ''', commission, referred_user_id, currency)
-    
-    await Database.add_to_balance(referrer_id, currency, commission)
-
-    try:
-        await bot.send_message(
-            chat_id=referrer_id,
-            text=f"💰 Вам начислена комиссия {commission:.2f} {currency} за подписку реферала (ID {referred_user_id})."
-        )
-    except Exception as e:
-        logger.error(f"Ошибка уведомления реферера {referrer_id}: {e}")
-
-# ---------- ФОНОВЫЕ ЗАДАЧИ ----------
-async def send_ad_to_user(bot, user_id: int, ad: Ad, telegram_semaphore):
-    """Отправляет одно объявление пользователю с защитой от флуда"""
-    async with telegram_semaphore:
-        if await Database.was_ad_sent_to_user(user_id, ad.id):
-            return
-            
-        owner_text = "Собственник" if ad.owner else "Агент"
-        deal_text = "Продажа" if ad.deal_type == 'sale' else "Аренда"
-        source_icon = "🏢" if ad.source == 'cian' else "📱"
-        source_name = "ЦИАН" if ad.source == 'cian' else "Авито"
-        
-        text = (
-            f"🔵 *Новое объявление ({source_icon} {source_name})*\n"
-            f"🏷 {ad.title}\n"
-            f"💰 Цена: {ad.price}\n"
-            f"📍 Адрес: {ad.address}\n"
-            f"🚇 Метро: {ad.metro}\n"
-            f"🏢 Этаж: {ad.floor}\n"
-            f"📏 Площадь: {ad.area}\n"
-            f"🛏 Комнат: {ad.rooms}\n"
-            f"👤 {owner_text} | {deal_text}\n"
-            f"[🔗 Ссылка на объявление]({ad.link})"
-        )
-        
-        # Обрезаем текст, если он слишком длинный
-        if len(text) > 1024 and ad.photos:
-            text = truncate_text(text, 1000)
-        
-        try:
-            if ad.photos and len(ad.photos) > 0:
-                media = []
-                media.append(
-                    InputMediaPhoto(
-                        media=ad.photos[0],
-                        caption=text,
-                        parse_mode='Markdown'
-                    )
-                )
-                for photo_url in ad.photos[1:5]:
-                    if photo_url:
-                        media.append(InputMediaPhoto(media=photo_url))
-                
-                await bot.send_media_group(chat_id=user_id, media=media)
-            else:
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=text,
-                    parse_mode='Markdown',
-                    disable_web_page_preview=True
-                )
-            
-            await Database.mark_ad_sent(user_id, ad.id)
-            await asyncio.sleep(0.1)
-            
-        except Exception as e:
-            logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
-
-def matches_filters(ad: Ad, filters_dict: dict) -> bool:
-    """Проверяет, подходит ли объявление под фильтры"""
-    districts = filters_dict.get('districts', [])
-    rooms = filters_dict.get('rooms', [])
-    metros = filters_dict.get('metros', [])
-    owner_only = filters_dict.get('owner_only', False)
-    deal_type = filters_dict.get('deal_type', 'sale')
-    sources = filters_dict.get('sources', ['cian', 'avito'])
-
-    if ad.source not in sources:
-        return False
-
-    if not districts and not rooms and not metros and not owner_only:
-        return False
-
-    if ad.deal_type != deal_type:
-        return False
-
-    if districts and ad.district_detected:
-        if ad.district_detected not in districts:
-            return False
-
-    if metros and ad.metro != 'Не указано':
-        ad_metro_clean = ad.metro.lower().replace('м.', '').strip()
-        found = False
-        for m in metros:
-            if m.lower() in ad_metro_clean or ad_metro_clean in m.lower():
-                found = True
-                break
-        if not found:
-            return False
-
-    if rooms:
-        room_type = None
-        rc = ad.rooms
-        if rc == 'студия':
-            room_type = 'Студия'
-        elif rc == '1':
-            room_type = '1-комнатная'
-        elif rc == '2':
-            room_type = '2-комнатная'
-        elif rc == '3':
-            room_type = '3-комнатная'
-        elif rc == '4' or (rc.isdigit() and int(rc) >= 4):
-            room_type = '4-комнатная+'
-        if room_type not in rooms:
-            return False
-
-    if owner_only and not ad.owner:
-        return False
-
-    return True
-
-async def collector_loop(app: Application):
-    """Фоновая задача: сбор объявлений и рассылка"""
-    # Импортируем семафор из bot, чтобы избежать циклического импорта
-    from bot import telegram_semaphore
-    
-    while True:
-        try:
-            logger.info("Запуск сбора объявлений со всех площадок")
-            
-            subscribers = await Database.get_active_subscribers()
-            if not subscribers:
-                logger.info("Нет активных подписчиков")
-                await asyncio.sleep(PARSING_INTERVAL)
-                continue
-
-            ads = await fetch_all_ads()
-            if not ads:
-                logger.info("Нет новых объявлений")
-                await asyncio.sleep(PARSING_INTERVAL)
-                continue
-
-            new_ads = []
-            for ad in ads:
-                if await Database.save_ad(ad):
-                    new_ads.append(ad)
-
-            if not new_ads:
-                logger.info("Нет новых объявлений после проверки БД")
-                await asyncio.sleep(PARSING_INTERVAL)
-                continue
-
-            logger.info(f"Найдено {len(new_ads)} новых объявлений, начинаем рассылку")
-
-            sent_count = 0
-            for ad in new_ads:
-                tasks = []
-                for user_id, filters_json in subscribers:
-                    if not filters_json:
-                        continue
-                    filters = json.loads(filters_json) if filters_json else {}
-                    if not filters.get('districts') and not filters.get('rooms') and not filters.get('metros') and not filters.get('owner_only'):
-                        continue
-                    
-                    if await Database.was_ad_sent_to_user(user_id, ad.id):
-                        continue
-                        
-                    if matches_filters(ad, filters):
-                        tasks.append(send_ad_to_user(app.bot, user_id, ad, telegram_semaphore))
-                        sent_count += 1
-                
-                if tasks:
-                    await asyncio.gather(*tasks)
-                    await asyncio.sleep(1)
-
-            logger.info(f"Рассылка завершена. Отправлено {sent_count} уведомлений")
-            
-        except Exception as e:
-            logger.error(f"Ошибка в collector_loop: {e}", exc_info=True)
-        
-        await asyncio.sleep(PARSING_INTERVAL)
-
-async def update_checker_loop(app: Application):
-    """Проверка обновлений в GitHub и автоматическое обновление, если включён режим отладки"""
-    while True:
-        try:
-            debug_mode = app.bot_data.get('debug_mode', False)
-            if debug_mode:
-                logger.info("Проверка обновлений GitHub...")
-                try:
-                    # Асинхронное выполнение git команд
-                    proc = await asyncio.create_subprocess_exec(
-                        'git', 'rev-parse', 'HEAD',
-                        cwd='/opt/bot',
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    stdout, stderr = await proc.communicate()
-                    current_commit = stdout.decode().strip()
-                    
-                    if GITHUB_TOKEN:
-                        # git fetch
-                        await asyncio.create_subprocess_exec('git', 'fetch', 'origin', GITHUB_BRANCH, cwd='/opt/bot')
-                        proc = await asyncio.create_subprocess_exec(
-                            'git', 'rev-parse', f'origin/{GITHUB_BRANCH}',
-                            cwd='/opt/bot',
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE
-                        )
-                    else:
-                        proc = await asyncio.create_subprocess_exec(
-                            'git', 'ls-remote', 'origin', GITHUB_BRANCH,
-                            cwd='/opt/bot',
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE
-                        )
-                    stdout, stderr = await proc.communicate()
-                    remote_output = stdout.decode().strip()
-                    if GITHUB_TOKEN:
-                        remote_commit = remote_output
-                    else:
-                        remote_commit = remote_output.split()[0] if remote_output else ''
-                    
-                    if remote_commit and remote_commit != current_commit:
-                        logger.info(f"Найдено обновление: {current_commit[:8]} -> {remote_commit[:8]}. Загружаем...")
-                        
-                        pull_proc = await asyncio.create_subprocess_exec(
-                            'git', 'pull', 'origin', GITHUB_BRANCH,
-                            cwd='/opt/bot',
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE
-                        )
-                        stdout, stderr = await pull_proc.communicate()
-                        if pull_proc.returncode == 0:
-                            logger.info("Код обновлён. Проверяем зависимости...")
-                            diff_proc = await asyncio.create_subprocess_exec(
-                                'git', 'diff', '--name-only', 'HEAD@{1}', 'HEAD',
-                                cwd='/opt/bot',
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE
-                            )
-                            stdout, stderr = await diff_proc.communicate()
-                            if 'requirements.txt' in stdout.decode():
-                                logger.info("Обновляем зависимости...")
-                                await asyncio.create_subprocess_exec(
-                                    sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt',
-                                    cwd='/opt/bot'
-                                )
-                            
-                            logger.info("Перезапуск бота...")
-                            await asyncio.create_subprocess_exec('systemctl', 'restart', 'bot.service')
-                            # Завершаем текущий процесс
-                            sys.exit(0)
-                        else:
-                            logger.error(f"Ошибка git pull: {stderr.decode()}")
-                except Exception as e:
-                    logger.error(f"Ошибка при проверке обновлений: {e}")
-        except Exception as e:
-            logger.error(f"Ошибка в цикле обновлений: {e}")
-        
-        await asyncio.sleep(AUTO_UPDATE_CHECK_INTERVAL)
 
 # ---------- АДМИНСКИЕ КОМАНДЫ (ЧЕРЕЗ /) ----------
 async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1686,14 +1679,12 @@ async def profile_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         filters_text = "⚙️ Фильтры не настроены"
 
-    # Информация о рефералах
     referrals_text = ""
     referrals = await Database.get_referrals(user_id)
     if referrals:
         ref_list = "\n".join([f"• {r['referred_id']} – {datetime.fromtimestamp(r['created_at']).strftime('%d.%m.%Y')} (комиссия: {r['payment_amount']} {r['currency']})" for r in referrals])
         referrals_text = f"\n\n📊 *Рефералы:*\n{ref_list}"
 
-    # Баланс в разных валютах
     balance_ton = await Database.get_balance(user_id, 'TON')
     balance_stars = await Database.get_balance(user_id, 'STARS')
     balance_rub = await Database.get_balance(user_id, 'RUB')
@@ -1733,7 +1724,7 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Ошибка: текст не найден.")
             return
         await q.edit_message_text("Рассылка началась... Это может занять некоторое время.")
-        users = await Database.get_all_users(limit=10000, offset=0)  # получить всех
+        users = await Database.get_all_users(limit=10000, offset=0)
         sent = 0
         failed = 0
         for user_id, _, _, _ in users:
@@ -1748,6 +1739,24 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await q.edit_message_text("Рассылка отменена.")
     context.user_data.pop('broadcast_text', None)
+
+async def broadcast_mods(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Введите текст рассылки.")
+        return
+    text = ' '.join(context.args)
+    mods = await Database.get_moderators()
+    sent = 0
+    for mod in mods:
+        try:
+            await context.bot.send_message(chat_id=mod['user_id'], text=text, parse_mode='Markdown')
+            sent += 1
+            await asyncio.sleep(0.05)
+        except:
+            pass
+    await update.message.reply_text(f"Рассылка модераторам завершена. Отправлено: {sent}")
 
 async def test_parse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -1766,6 +1775,23 @@ async def daily_by_metro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Заглушка - можно реализовать позже
     await update.message.reply_text("Функция в разработке.")
 
+async def admin_active_subs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    rows = await Database.get_active_subscribers_detailed()
+    if not rows:
+        await update.message.reply_text("Нет активных подписчиков.")
+        return
+    text = "**Активные подписчики:**\n\n"
+    for row in rows:
+        user_id = row['user_id']
+        until = row['subscribed_until']
+        plan = row['plan'] or '—'
+        source = row['subscription_source'] or 'unknown'
+        remaining = (until - int(time.time())) // 86400
+        text += f"• `{user_id}` | {plan} | осталось {remaining} дн. | источник: {source}\n"
+    await update.message.reply_text(text, parse_mode='Markdown')
+
 async def add_mod_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -1779,6 +1805,25 @@ async def add_mod_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     perms = ['view_tickets', 'view_stats']
     await Database.add_moderator(user_id, perms, ADMIN_ID)
+    
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🎉 *Поздравляем! Вы стали модератором.*\n\n"
+                "Теперь вам доступны следующие команды:\n"
+                "• `/mod` – панель модератора\n"
+                "• `/tickets` – список открытых тикетов\n"
+                "• `/reply <id> <текст>` – ответить пользователю\n"
+                "• `/close_ticket <id>` – закрыть тикет\n"
+                "• `/view_ticket <id>` – история переписки по тикету\n\n"
+                "Пожалуйста, используйте свои права ответственно."
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Не удалось уведомить нового модератора {user_id}: {e}")
+    
     await update.message.reply_text(f"✅ Модератор {user_id} добавлен.")
 
 async def remove_mod_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1815,3 +1860,317 @@ async def debug_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.bot_data['debug_mode'] = False
     await update.message.reply_text("✅ Режим отладки выключен.")
+
+# ---------- БАН / РАЗБАН ----------
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        user_id = int(context.args[0])
+    except:
+        await update.message.reply_text("Использование: /ban <user_id>")
+        return
+    await Database.ban_user(user_id)
+    await update.message.reply_text(f"Пользователь {user_id} забанен.")
+
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        user_id = int(context.args[0])
+    except:
+        await update.message.reply_text("Использование: /unban <user_id>")
+        return
+    await Database.unban_user(user_id)
+    await update.message.reply_text(f"Пользователь {user_id} разбанен.")
+
+# ---------- УПРАВЛЕНИЕ БАЛАНСОМ ----------
+async def set_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        user_id = int(context.args[0])
+        currency = context.args[1].upper()
+        amount = float(context.args[2])
+    except:
+        await update.message.reply_text("Использование: /set_balance <user_id> <currency> <amount>")
+        return
+    # Обнуляем текущий баланс
+    current = await Database.get_balance(user_id, currency)
+    if current > 0:
+        await Database.deduct_from_balance(user_id, currency, current)
+    await Database.add_to_balance(user_id, currency, amount)
+    await update.message.reply_text(f"Баланс {user_id} в {currency} установлен на {amount}.")
+
+async def add_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        user_id = int(context.args[0])
+        currency = context.args[1].upper()
+        amount = float(context.args[2])
+    except:
+        await update.message.reply_text("Использование: /add_balance <user_id> <currency> <amount>")
+        return
+    await Database.add_to_balance(user_id, currency, amount)
+    await update.message.reply_text(f"Добавлено {amount} {currency} пользователю {user_id}.")
+
+# ---------- ЭКСПОРТ ПОЛЬЗОВАТЕЛЕЙ ----------
+async def export_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    users = await Database.get_all_users(limit=10000, offset=0)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['user_id', 'subscribed_until', 'plan', 'subscription_source', 'role', 'referrer_id'])
+    for row in users:
+        writer.writerow(row)
+    output.seek(0)
+    await update.message.reply_document(document=output.getvalue().encode(), filename='users.csv')
+
+# ---------- ФОНОВЫЕ ЗАДАЧИ ----------
+async def send_ad_to_user(bot, user_id: int, ad: Ad, telegram_semaphore):
+    """Отправляет одно объявление пользователю с защитой от флуда"""
+    async with telegram_semaphore:
+        if await Database.was_ad_sent_to_user(user_id, ad.id):
+            return
+            
+        owner_text = "Собственник" if ad.owner else "Агент"
+        deal_text = "Продажа" if ad.deal_type == 'sale' else "Аренда"
+        source_icon = "🏢" if ad.source == 'cian' else "📱"
+        source_name = "ЦИАН" if ad.source == 'cian' else "Авито"
+        
+        text = (
+            f"🔵 *Новое объявление ({source_icon} {source_name})*\n"
+            f"🏷 {ad.title}\n"
+            f"💰 Цена: {ad.price}\n"
+            f"📍 Адрес: {ad.address}\n"
+            f"🚇 Метро: {ad.metro}\n"
+            f"🏢 Этаж: {ad.floor}\n"
+            f"📏 Площадь: {ad.area}\n"
+            f"🛏 Комнат: {ad.rooms}\n"
+            f"👤 {owner_text} | {deal_text}\n"
+            f"[🔗 Ссылка на объявление]({ad.link})"
+        )
+        
+        if len(text) > 1024 and ad.photos:
+            text = truncate_text(text, 1000)
+        
+        try:
+            if ad.photos and len(ad.photos) > 0:
+                media = []
+                media.append(
+                    InputMediaPhoto(
+                        media=ad.photos[0],
+                        caption=text,
+                        parse_mode='Markdown'
+                    )
+                )
+                for photo_url in ad.photos[1:5]:
+                    if photo_url:
+                        media.append(InputMediaPhoto(media=photo_url))
+                
+                await bot.send_media_group(chat_id=user_id, media=media)
+            else:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=text,
+                    parse_mode='Markdown',
+                    disable_web_page_preview=True
+                )
+            
+            await Database.mark_ad_sent(user_id, ad.id)
+            await asyncio.sleep(0.1)
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
+
+def matches_filters(ad: Ad, filters_dict: dict) -> bool:
+    """Проверяет, подходит ли объявление под фильтры"""
+    districts = filters_dict.get('districts', [])
+    rooms = filters_dict.get('rooms', [])
+    metros = filters_dict.get('metros', [])
+    owner_only = filters_dict.get('owner_only', False)
+    deal_type = filters_dict.get('deal_type', 'sale')
+    sources = filters_dict.get('sources', ['cian', 'avito'])
+
+    if ad.source not in sources:
+        return False
+
+    if not districts and not rooms and not metros and not owner_only:
+        return False
+
+    if ad.deal_type != deal_type:
+        return False
+
+    if districts and ad.district_detected:
+        if ad.district_detected not in districts:
+            return False
+
+    if metros and ad.metro != 'Не указано':
+        ad_metro_clean = ad.metro.lower().replace('м.', '').strip()
+        found = False
+        for m in metros:
+            if m.lower() in ad_metro_clean or ad_metro_clean in m.lower():
+                found = True
+                break
+        if not found:
+            return False
+
+    if rooms:
+        room_type = None
+        rc = ad.rooms
+        if rc == 'студия':
+            room_type = 'Студия'
+        elif rc == '1':
+            room_type = '1-комнатная'
+        elif rc == '2':
+            room_type = '2-комнатная'
+        elif rc == '3':
+            room_type = '3-комнатная'
+        elif rc == '4' or (rc.isdigit() and int(rc) >= 4):
+            room_type = '4-комнатная+'
+        if room_type not in rooms:
+            return False
+
+    if owner_only and not ad.owner:
+        return False
+
+    return True
+
+async def collector_loop(app: Application):
+    """Фоновая задача: сбор объявлений и рассылка"""
+    telegram_semaphore = app.bot_data.get('telegram_semaphore')
+    
+    while True:
+        try:
+            logger.info("Запуск сбора объявлений со всех площадок")
+            
+            subscribers = await Database.get_active_subscribers()
+            if not subscribers:
+                logger.info("Нет активных подписчиков")
+                await asyncio.sleep(PARSING_INTERVAL)
+                continue
+
+            ads = await fetch_all_ads()
+            if not ads:
+                logger.info("Нет новых объявлений")
+                await asyncio.sleep(PARSING_INTERVAL)
+                continue
+
+            new_ads = []
+            for ad in ads:
+                if await Database.save_ad(ad):
+                    new_ads.append(ad)
+
+            if not new_ads:
+                logger.info("Нет новых объявлений после проверки БД")
+                await asyncio.sleep(PARSING_INTERVAL)
+                continue
+
+            logger.info(f"Найдено {len(new_ads)} новых объявлений, начинаем рассылку")
+
+            sent_count = 0
+            for ad in new_ads:
+                tasks = []
+                for user_id, filters_json in subscribers:
+                    if not filters_json:
+                        continue
+                    filters = json.loads(filters_json) if filters_json else {}
+                    if not filters.get('districts') and not filters.get('rooms') and not filters.get('metros') and not filters.get('owner_only'):
+                        continue
+                    
+                    if await Database.was_ad_sent_to_user(user_id, ad.id):
+                        continue
+                        
+                    if matches_filters(ad, filters):
+                        tasks.append(send_ad_to_user(app.bot, user_id, ad, telegram_semaphore))
+                        sent_count += 1
+                
+                if tasks:
+                    await asyncio.gather(*tasks)
+                    await asyncio.sleep(1)
+
+            logger.info(f"Рассылка завершена. Отправлено {sent_count} уведомлений")
+            
+        except Exception as e:
+            logger.error(f"Ошибка в collector_loop: {e}", exc_info=True)
+        
+        await asyncio.sleep(PARSING_INTERVAL)
+
+async def update_checker_loop(app: Application):
+    """Проверка обновлений в GitHub и автоматическое обновление, если включён режим отладки"""
+    while True:
+        try:
+            debug_mode = app.bot_data.get('debug_mode', False)
+            if debug_mode:
+                logger.info("Проверка обновлений GitHub...")
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        'git', 'rev-parse', 'HEAD',
+                        cwd='/opt/bot',
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await proc.communicate()
+                    current_commit = stdout.decode().strip()
+                    
+                    if GITHUB_TOKEN:
+                        await asyncio.create_subprocess_exec('git', 'fetch', 'origin', GITHUB_BRANCH, cwd='/opt/bot')
+                        proc = await asyncio.create_subprocess_exec(
+                            'git', 'rev-parse', f'origin/{GITHUB_BRANCH}',
+                            cwd='/opt/bot',
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                    else:
+                        proc = await asyncio.create_subprocess_exec(
+                            'git', 'ls-remote', 'origin', GITHUB_BRANCH,
+                            cwd='/opt/bot',
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                    stdout, stderr = await proc.communicate()
+                    remote_output = stdout.decode().strip()
+                    if GITHUB_TOKEN:
+                        remote_commit = remote_output
+                    else:
+                        remote_commit = remote_output.split()[0] if remote_output else ''
+                    
+                    if remote_commit and remote_commit != current_commit:
+                        logger.info(f"Найдено обновление: {current_commit[:8]} -> {remote_commit[:8]}. Загружаем...")
+                        
+                        pull_proc = await asyncio.create_subprocess_exec(
+                            'git', 'pull', 'origin', GITHUB_BRANCH,
+                            cwd='/opt/bot',
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        stdout, stderr = await pull_proc.communicate()
+                        if pull_proc.returncode == 0:
+                            logger.info("Код обновлён. Проверяем зависимости...")
+                            diff_proc = await asyncio.create_subprocess_exec(
+                                'git', 'diff', '--name-only', 'HEAD@{1}', 'HEAD',
+                                cwd='/opt/bot',
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE
+                            )
+                            stdout, stderr = await diff_proc.communicate()
+                            if 'requirements.txt' in stdout.decode():
+                                logger.info("Обновляем зависимости...")
+                                await asyncio.create_subprocess_exec(
+                                    sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt',
+                                    cwd='/opt/bot'
+                                )
+                            
+                            logger.info("Перезапуск бота...")
+                            await asyncio.create_subprocess_exec('systemctl', 'restart', 'bot.service')
+                            sys.exit(0)
+                        else:
+                            logger.error(f"Ошибка git pull: {stderr.decode()}")
+                except Exception as e:
+                    logger.error(f"Ошибка при проверке обновлений: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка в цикле обновлений: {e}")
+        
+        await asyncio.sleep(AUTO_UPDATE_CHECK_INTERVAL)
