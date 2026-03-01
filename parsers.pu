@@ -119,10 +119,70 @@ async def fetch_cian_deal_type(deal_type: str = 'sale') -> List[Ad]:
                 continue
             seen_ids.add(ad_id)
             
-            # ... парсинг полей (аналогично оригинальному коду) ...
-            # Здесь нужно скопировать логику из оригинального кода для извлечения title, price, address и т.д.
-            # В целях экономии места я пропускаю детали, но они должны быть перенесены.
-            # Создаём объект Ad
+            # Парсинг полей
+            price_tag = (card.find('span', {'data-mark': 'MainPrice'}) or 
+                        card.find('span', class_=re.compile('price')) or
+                        card.find('meta', {'itemprop': 'price'}))
+            if price_tag and price_tag.name == 'meta':
+                price = price_tag.get('content', 'Цена не указана')
+            else:
+                price = price_tag.text.strip() if price_tag else 'Цена не указана'
+            
+            address_tag = (card.find('address') or 
+                          card.find('span', class_=re.compile('address')) or
+                          card.find('span', {'data-testid': 'address'}))
+            address = address_tag.text.strip() if address_tag else 'Москва'
+            
+            metro_tag = (card.find('span', class_=re.compile('underground')) or 
+                        card.find('a', href=re.compile('metro')))
+            metro = metro_tag.text.strip() if metro_tag else 'Не указано'
+            
+            title_tag = card.find('h3') or card.find('a', {'data-testid': 'title'})
+            title = title_tag.text.strip() if title_tag else 'Квартира'
+            
+            full_text = card.get_text(separator=' ', strip=True).lower()
+            
+            rooms_count = '?'
+            room_match = re.search(r'(\d+)[-\s]комнат', title.lower())
+            if room_match:
+                rooms_count = room_match.group(1)
+            else:
+                room_match = re.search(r'(\d+)[-\s]комнат', full_text)
+                if room_match:
+                    rooms_count = room_match.group(1)
+                elif 'студия' in full_text or 'студия' in title.lower():
+                    rooms_count = 'студия'
+            
+            floor = '?/?'
+            floor_match = re.search(r'(\d+)[-\s]этаж\s+из\s+(\d+)', full_text)
+            if floor_match:
+                floor = f"{floor_match.group(1)}/{floor_match.group(2)}"
+            else:
+                floor_match = re.search(r'(\d+)[-\s]этаж', full_text)
+                if floor_match:
+                    floor = f"{floor_match.group(1)}/?"
+            
+            area = '? м²'
+            area_match = re.search(r'(\d+(?:[.,]\d+)?)\s*м²', full_text)
+            if area_match:
+                area = f"{area_match.group(1).replace('.', ',')} м²"
+            
+            owner_tag = card.find('span', text=re.compile('собственник|без посредников', re.I))
+            is_owner = bool(owner_tag)
+            
+            photos = []
+            img_tags = card.find_all('img', src=True)[:10]
+            for img in img_tags:
+                src = img['src']
+                if src.startswith('//'):
+                    src = 'https:' + src
+                if 'avatar' not in src and not src.endswith('.svg') and 'blank' not in src and 'placeholder' not in src:
+                    photos.append(src)
+            
+            district_detected = None
+            if DADATA_API_KEY:
+                district_detected = await get_district_by_address(address)
+            
             ad = Ad(
                 id=ad_id,
                 source='cian',
@@ -147,10 +207,125 @@ async def fetch_cian_deal_type(deal_type: str = 'sale') -> List[Ad]:
     logger.info(f"ЦИАН ({deal_type}): собрано {len(results)} объявлений")
     return results
 
-# Аналогично для fetch_avito_deal_type (адаптировать под модель Ad)
 async def fetch_avito_deal_type(deal_type: str = 'sale') -> List[Ad]:
-    # ... аналогично ...
-    pass
+    """Собирает объявления с Авито"""
+    avito_category = {
+        'sale': 'prodazha-kvartir',
+        'rent': 'snyat-kvartiru'
+    }.get(deal_type, 'prodazha-kvartir')
+    
+    url = f"https://www.avito.ru/moskva/kvartiry/{avito_category}"
+    params = {
+        's': '1',
+        'p': '1'
+    }
+    
+    html = await get_page_html_playwright(url, params, use_proxy=True)
+    if not html:
+        return []
+    
+    soup = BeautifulSoup(html, 'lxml')
+    cards = soup.find_all('div', {'data-marker': 'item'}) or soup.find_all('div', {'itemtype': 'http://schema.org/Product'})
+    
+    results = []
+    seen_ids = set()
+    
+    for card in cards[:30]:
+        try:
+            link_tag = card.find('a', {'data-marker': 'item-title'}) or card.find('a', href=True)
+            if not link_tag:
+                continue
+            link = link_tag.get('href', '')
+            if link.startswith('/'):
+                link = 'https://www.avito.ru' + link
+            
+            ad_id_match = re.search(r'/(\d+)$', link)
+            ad_id = ad_id_match.group(1) if ad_id_match else hashlib.md5(link.encode()).hexdigest()
+            ad_id = f"avito_{ad_id}"
+            
+            if ad_id in seen_ids:
+                continue
+            seen_ids.add(ad_id)
+            
+            title_tag = card.find('meta', {'itemprop': 'name'})
+            if title_tag:
+                title = title_tag.get('content', '')
+            else:
+                title_tag = card.find('h3')
+                title = title_tag.text.strip() if title_tag else 'Квартира'
+            
+            price_tag = card.find('meta', {'itemprop': 'price'})
+            if price_tag:
+                price = price_tag.get('content', 'Цена не указана') + ' ₽'
+            else:
+                price_tag = card.find('span', {'data-marker': 'item-price'})
+                price = price_tag.text.strip() if price_tag else 'Цена не указана'
+            
+            address_tag = card.find('span', {'data-marker': 'item-address'})
+            address = address_tag.text.strip() if address_tag else 'Москва'
+            
+            metro_tag = card.find('span', {'data-marker': 'item-metro'})
+            metro = metro_tag.text.strip() if metro_tag else 'Не указано'
+            if 'м.' in metro:
+                metro = metro.replace('м.', '').strip()
+            
+            full_text = card.get_text(separator=' ', strip=True).lower()
+            
+            rooms_count = '?'
+            room_match = re.search(r'(\d+)[-\s]комнат', full_text)
+            if room_match:
+                rooms_count = room_match.group(1)
+            elif 'студия' in full_text:
+                rooms_count = 'студия'
+            
+            floor = '?/?'
+            floor_match = re.search(r'(\d+)[-\s]этаж\s+из\s+(\d+)', full_text)
+            if floor_match:
+                floor = f"{floor_match.group(1)}/{floor_match.group(2)}"
+            
+            area = '? м²'
+            area_match = re.search(r'(\d+(?:[.,]\d+)?)\s*м²', full_text)
+            if area_match:
+                area = f"{area_match.group(1).replace('.', ',')} м²"
+            
+            is_owner = 'собственник' in full_text or 'без посредников' in full_text or 'частное лицо' in full_text
+            
+            photos = []
+            img_tags = card.find_all('img', src=True)[:5]
+            for img in img_tags:
+                src = img['src']
+                if src.startswith('//'):
+                    src = 'https:' + src
+                if 'avatar' not in src and not src.endswith('.svg'):
+                    photos.append(src)
+            
+            district_detected = None
+            if DADATA_API_KEY:
+                district_detected = await get_district_by_address(address)
+            
+            ad = Ad(
+                id=ad_id,
+                source='avito',
+                deal_type=deal_type,
+                title=title,
+                link=link,
+                price=price,
+                address=address,
+                metro=metro,
+                floor=floor,
+                area=area,
+                rooms=rooms_count,
+                owner=is_owner,
+                photos=photos,
+                district_detected=district_detected
+            )
+            results.append(ad)
+        except Exception as e:
+            logger.error(f"Ошибка парсинга карточки Авито: {e}")
+            continue
+    
+    logger.info(f"Авито ({deal_type}): собрано {len(results)} объявлений")
+    return results
 
 async def fetch_all_ads() -> List[Ad]:
     """Собирает объявления со всех источников"""
@@ -170,7 +345,6 @@ async def fetch_all_ads() -> List[Ad]:
         elif isinstance(res, list):
             all_ads.extend(res)
     
-    # Уникализация по id
     seen = set()
     unique_ads = []
     for ad in all_ads:
@@ -197,7 +371,7 @@ async def get_district_by_address(address: str) -> Optional[str]:
                 res = await resp.json()
         result = res[0]
         if result.get('area_type') == "округ" and result.get('area'):
-            # Маппинг названий округов из DaData к вашим кодам
+            # Маппинг названий округов из DaData к вашим кодам (если нужно)
             return result['area']
     except Exception as e:
         logger.debug(f"Ошибка DaData: {e}")
