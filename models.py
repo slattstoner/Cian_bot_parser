@@ -1,6 +1,5 @@
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List
-from datetime import datetime
 import re
 
 class Ad(BaseModel):
@@ -49,3 +48,14 @@ class Payment(BaseModel):
     source: str = 'ton_manual'
     created_at: int
     confirmed_at: Optional[int] = None
+
+class User(BaseModel):
+    user_id: int
+    role: str = 'user'
+    referrer_id: Optional[int] = None
+    filters: Optional[UserFilters] = None
+    subscribed_until: Optional[int] = None
+    last_ad_id: Optional[str] = None
+    plan: Optional[str] = None
+    subscription_source: Optional[str] = None
+    created_at: int
