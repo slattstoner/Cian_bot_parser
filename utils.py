@@ -23,9 +23,8 @@ async def check_user_exists(bot, user_id: int) -> bool:
     except Exception:
         return False
 
-# Вспомогательная функция для graceful shutdown
-async def shutdown(app):
-    logger.info("Получен сигнал завершения, закрываем соединения...")
-    from database import Database
-    await Database.close()
-    # Остановка других задач при необходимости
+# Функция для безопасного получения имени пользователя
+def get_user_mention(user):
+    if user.username:
+        return f"@{user.username}"
+    return f"{user.full_name} (id: {user.id})"
