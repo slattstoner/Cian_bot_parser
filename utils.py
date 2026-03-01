@@ -28,3 +28,12 @@ def get_user_mention(user):
     if user.username:
         return f"@{user.username}"
     return f"{user.full_name} (id: {user.id})"
+    import logging
+logger = logging.getLogger(__name__)
+
+async def shutdown(app):
+    """Graceful shutdown: закрываем соединения с БД и останавливаем задачи"""
+    logger.info("Получен сигнал завершения, закрываем соединения...")
+    from database import Database
+    await Database.close()
+    # Остановка других задач при необходимости
