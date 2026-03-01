@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field, validator
 from typing import Optional, List
 import re
 
+
 class Ad(BaseModel):
     id: str
     source: str = 'cian'
@@ -19,13 +20,20 @@ class Ad(BaseModel):
     district_detected: Optional[str] = None
     price_value: int = 0
 
-    @validator('price_value', always=True)
+    @validator('price_value', always=True, pre=True)
     def extract_price_value(cls, v, values):
-        if 'price' in values and values['price'] != 'Цена не указана':
-            match = re.search(r'(\d+[\s\d]*)', values['price'].replace(' ', ''))
-            if match:
-                return int(match.group(1).replace(' ', ''))
+        if v:
+            return v
+        price = values.get('price', '')
+        if price and price != 'Цена не указана':
+            cleaned = re.sub(r'[^\d]', '', price)
+            if cleaned:
+                try:
+                    return int(cleaned)
+                except:
+                    pass
         return 0
+
 
 class UserFilters(BaseModel):
     city: str = 'Москва'
@@ -35,6 +43,7 @@ class UserFilters(BaseModel):
     owner_only: bool = False
     deal_type: str = 'sale'
     sources: List[str] = ['cian', 'avito']
+
 
 class Payment(BaseModel):
     id: int
@@ -48,6 +57,7 @@ class Payment(BaseModel):
     source: str = 'ton_manual'
     created_at: int
     confirmed_at: Optional[int] = None
+
 
 class User(BaseModel):
     user_id: int
