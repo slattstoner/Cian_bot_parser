@@ -415,10 +415,11 @@ async def pay_ton(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pay_rub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"PAYMENT_PROVIDER_TOKEN = {PAYMENT_PROVIDER_TOKEN}")  # ← добавить
     if not PAYMENT_PROVIDER_TOKEN:
-        await update.callback_query.answer(
-            "Оплата картой временно недоступна. Выберите другой способ.", show_alert=True)
+        await update.callback_query.answer("Оплата картой временно недоступна. Выберите другой способ.", show_alert=True)
         return
+    # остальной код...
     q = update.callback_query
     await q.answer()
     plan = context.user_data.get('plan', '1m')
