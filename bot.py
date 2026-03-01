@@ -64,7 +64,6 @@ logger = logging.getLogger(__name__)
 
 
 async def post_init(app: Application):
-    """Инициализация после запуска"""
     await Database.init(DATABASE_URL)
     app.bot_data['telegram_semaphore'] = asyncio.Semaphore(TELEGRAM_RATE_LIMIT)
     app.bot_data['debug_mode'] = False
@@ -145,7 +144,7 @@ def main():
     app.add_handler(CallbackQueryHandler(plan_chosen, pattern='^p\d+m$'))
     app.add_handler(CallbackQueryHandler(pay_stars, pattern='^pay_stars$'))
     app.add_handler(CallbackQueryHandler(pay_ton, pattern='^pay_ton$'))
-    app.add_handler(CallbackQueryHandler(pay_rub, pattern='^pay_rub$'))
+    app.add_handler(CallbackQueryHandler(pay_rub, pattern='^pay_rub$'))  # ← должно быть
     app.add_handler(CallbackQueryHandler(pay_balance, pattern='^pay_balance$'))
     app.add_handler(CallbackQueryHandler(balance_pay_confirm, pattern='^balpay_'))
 
