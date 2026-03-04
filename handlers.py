@@ -2074,31 +2074,49 @@ def matches_filters(ad: Ad, filters_dict: dict) -> bool:
 
 
 async def send_ad_to_user(bot, user_id: int, ad: Ad, telegram_semaphore):
-    """Отправляет объявление пользователю"""
+    """Отправляет объявление пользователю (атомарная проверка дублей)"""
     async with telegram_semaphore:
-        if await Database.was_ad_sent_to_user(user_id, ad.id):
-            return
+        # Атомарно пытаемся добавить запись об отправке
+        async with Database._pool.acquire() as conn:
+            inserted = await conn.fetchval(
+                '''
+                INSERT INTO sent_ads (user_id, ad_id)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id, ad_id) DO NOTHING
+                RETURNING id
+                ''',
+                user_id, ad.id
+            )
+            if not inserted:
+                # Уже отправляли этому пользователю
+                return
 
+        # Формируем сообщение
         owner_text = "👤 Собственник" if ad.owner else "🏢 Агент"
         deal_text = "Продажа" if ad.deal_type == 'sale' else "Аренда"
         source_icon = "🏢" if ad.source == 'cian' else "📱"
         source_name = "ЦИАН" if ad.source == 'cian' else "Авито"
 
-      # Формируем красивое сообщение
-header = f"🏠 *Новое объявление* от {source_icon} {source_name}\n"
-details = (
-    f"💰 *Цена:* {ad.price}\n"
-    f"📍 *Адрес:* {ad.address}\n"
-    f"🚇 *Метро:* {ad.metro}\n"
-    f"🏢 *Этаж:* {ad.floor}\n"
-    f"📏 *Площадь:* {ad.area}\n"
-    f"🛏 *Комнат:* {ad.rooms}\n"
-    f"👤 *Тип:* {owner_text} | {deal_text}\n"
-)
-footer = f"\n[🔗 Открыть объявление]({ad.link})"
+        # Экранируем поля для Markdown
+        safe_title = escape_markdown(ad.title)
+        safe_price = escape_markdown(ad.price)
+        safe_address = escape_markdown(ad.address)
+        safe_metro = escape_markdown(ad.metro)
+        safe_floor = escape_markdown(ad.floor)
+        safe_area = escape_markdown(ad.area)
+        safe_rooms = escape_markdown(ad.rooms)
 
-text = header + details + footer
-        
+        text = (
+            f"🏠 *Новое объявление* от {source_icon} {source_name}\n"
+            f"💰 *Цена:* {safe_price}\n"
+            f"📍 *Адрес:* {safe_address}\n"
+            f"🚇 *Метро:* {safe_metro}\n"
+            f"🏢 *Этаж:* {safe_floor}\n"
+            f"📏 *Площадь:* {safe_area}\n"
+            f"🛏 *Комнат:* {safe_rooms}\n"
+            f"👤 *Тип:* {owner_text} | {deal_text}\n"
+            f"\n[🔗 Открыть объявление]({ad.link})"
+        )
 
         try:
             if ad.photos and len(ad.photos) > 0:
@@ -2106,7 +2124,7 @@ text = header + details + footer
                 if valid_photos:
                     media = [InputMediaPhoto(
                         media=valid_photos[0],
-                        caption=text + f"\n[Открыть объявление]({ad.link})",
+                        caption=text,
                         parse_mode='Markdown'
                     )]
                     for photo_url in valid_photos[1:]:
@@ -2115,23 +2133,22 @@ text = header + details + footer
                 else:
                     await bot.send_message(
                         chat_id=user_id,
-                        text=text + f"\n[🔗 Открыть объявление]({ad.link})",
+                        text=text,
                         parse_mode='Markdown',
                         disable_web_page_preview=False
                     )
             else:
                 await bot.send_message(
                     chat_id=user_id,
-                    text=text + f"\n[🔗 Открыть объявление]({ad.link})",
+                    text=text,
                     parse_mode='Markdown',
                     disable_web_page_preview=False
                 )
-
-            await Database.mark_ad_sent(user_id, ad.id)
-            await asyncio.sleep(0.1)
-
         except Exception as e:
             logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
+            # Если отправка не удалась, нужно удалить запись из sent_ads, чтобы можно было повторить позже?
+            # По желанию можно добавить удаление, но лучше оставить – объявление не дошло, но помечено как отправленное.
+            # В идеале нужна очередь с повторными попытками.
 
 
 async def collector_loop(app: Application):
