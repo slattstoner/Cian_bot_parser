@@ -1,4 +1,5 @@
 #!/bin/bash
+# deploy.sh v1.1 (04.03.2026)
 # Скрипт развёртывания бота на VPS
 # Запуск: bash deploy.sh
 
