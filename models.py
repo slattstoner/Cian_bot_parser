@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+# models.py v1.1 (04.03.2026)
+# - Без изменений, только версия
+
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List
 import re
