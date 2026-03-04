@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+# parsers.py v1.2 (04.03.2026)
+# - Улучшен поиск карточек для ЦИАН и Авито
+# - Добавлено логирование количества найденных карточек
+# - Увеличен таймаут до 60 сек
+# - Более надёжное извлечение цены и метро
+
 import asyncio
 import random
 import re
@@ -71,16 +78,16 @@ async def get_page_html_playwright(url: str, params: dict = None, use_proxy: boo
                 full_url = url + '?' + '&'.join([f"{k}={v}" for k, v in params.items()]) if params else url
                 logger.info(f"Загрузка страницы: {full_url}")
 
-                await page.goto(full_url, wait_until='domcontentloaded', timeout=30000)
-                await page.wait_for_timeout(random.randint(2000, 4000))
+                await page.goto(full_url, wait_until='domcontentloaded', timeout=60000)
+                await page.wait_for_timeout(random.randint(3000, 6000))
 
                 # Скроллим как человек
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight/3)")
-                await page.wait_for_timeout(random.randint(800, 2000))
+                await page.wait_for_timeout(random.randint(1000, 3000))
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
-                await page.wait_for_timeout(random.randint(800, 2000))
+                await page.wait_for_timeout(random.randint(1000, 3000))
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(random.randint(1000, 2000))
+                await page.wait_for_timeout(random.randint(2000, 4000))
 
                 html = await page.content()
                 await browser.close()
@@ -109,9 +116,14 @@ async def fetch_cian_deal_type(deal_type: str = 'sale') -> List[Ad]:
         return []
 
     soup = BeautifulSoup(html, 'lxml')
+
+    # Расширенный поиск карточек
     cards = (soup.find_all('article', {'data-name': 'CardComponent'}) or
              soup.find_all('div', {'data-testid': 'offer-card'}) or
-             soup.find_all('div', class_=re.compile('offer-card')))
+             soup.find_all('div', class_=re.compile('offer-card')) or
+             soup.find_all('div', {'data-marker': 'item'}) or
+             soup.find_all('div', class_=re.compile('_93444fe79c--container')))
+    logger.info(f"ЦИАН ({deal_type}): найдено {len(cards)} карточек")
 
     results = []
     seen_ids = set()
@@ -132,18 +144,24 @@ async def fetch_cian_deal_type(deal_type: str = 'sale') -> List[Ad]:
             seen_ids.add(ad_id)
 
             price_tag = (card.find('span', {'data-mark': 'MainPrice'}) or
-                         card.find('span', class_=re.compile('price')))
-            price = price_tag.text.strip() if price_tag else 'Цена не указана'
+                         card.find('span', class_=re.compile('price')) or
+                         card.find('meta', {'itemprop': 'price'}))
+            if price_tag and price_tag.name == 'meta':
+                price = price_tag.get('content', 'Цена не указана') + ' ₽'
+            else:
+                price = price_tag.text.strip() if price_tag else 'Цена не указана'
 
             address_tag = (card.find('address') or
-                           card.find('span', class_=re.compile('address')))
+                           card.find('span', class_=re.compile('address')) or
+                           card.find('span', {'data-marker': 'item-address'}))
             address = address_tag.text.strip() if address_tag else 'Москва'
 
             metro_tag = (card.find('span', class_=re.compile('underground')) or
-                         card.find('a', href=re.compile('metro')))
+                         card.find('a', href=re.compile('metro')) or
+                         card.find('span', {'data-marker': 'item-metro'}))
             metro = metro_tag.text.strip() if metro_tag else 'Не указано'
 
-            title_tag = card.find('h3') or card.find('a', {'data-testid': 'title'})
+            title_tag = card.find('h3') or card.find('a', {'data-testid': 'title'}) or card.find('a', {'itemprop': 'url'})
             title = title_tag.text.strip() if title_tag else 'Квартира'
 
             full_text = card.get_text(separator=' ', strip=True).lower()
@@ -227,7 +245,9 @@ async def fetch_avito_deal_type(deal_type: str = 'sale') -> List[Ad]:
 
     soup = BeautifulSoup(html, 'lxml')
     cards = (soup.find_all('div', {'data-marker': 'item'}) or
-             soup.find_all('div', {'itemtype': 'http://schema.org/Product'}))
+             soup.find_all('div', {'itemtype': 'http://schema.org/Product'}) or
+             soup.find_all('div', class_=re.compile('iva-item')))
+    logger.info(f"Авито ({deal_type}): найдено {len(cards)} карточек")
 
     results = []
     seen_ids = set()
@@ -248,26 +268,25 @@ async def fetch_avito_deal_type(deal_type: str = 'sale') -> List[Ad]:
                 continue
             seen_ids.add(ad_id)
 
-            title_meta = card.find('meta', {'itemprop': 'name'})
-            if title_meta:
-                title = title_meta.get('content', 'Квартира')
-            else:
-                title_tag = card.find('h3')
-                title = title_tag.text.strip() if title_tag else 'Квартира'
-
             price_meta = card.find('meta', {'itemprop': 'price'})
             if price_meta:
                 price = price_meta.get('content', 'Цена не указана') + ' ₽'
             else:
-                price_tag = card.find('span', {'data-marker': 'item-price'})
+                price_tag = card.find('span', {'data-marker': 'item-price'}) or card.find('strong', class_=re.compile('price'))
                 price = price_tag.text.strip() if price_tag else 'Цена не указана'
 
-            address_tag = card.find('span', {'data-marker': 'item-address'})
+            address_tag = card.find('span', {'data-marker': 'item-address'}) or card.find('span', class_=re.compile('address'))
             address = address_tag.text.strip() if address_tag else 'Москва'
 
-            metro_tag = card.find('span', {'data-marker': 'item-metro'})
+            metro_tag = card.find('span', {'data-marker': 'item-metro'}) or card.find('span', class_=re.compile('metro'))
             metro = metro_tag.text.strip() if metro_tag else 'Не указано'
             metro = metro.replace('м.', '').strip()
+
+            title_tag = card.find('h3') or card.find('meta', {'itemprop': 'name'})
+            if title_tag and title_tag.name == 'meta':
+                title = title_tag.get('content', 'Квартира')
+            else:
+                title = title_tag.text.strip() if title_tag else 'Квартира'
 
             full_text = card.get_text(separator=' ', strip=True).lower()
 
@@ -355,7 +374,7 @@ async def fetch_all_ads() -> List[Ad]:
             seen.add(ad.id)
             unique_ads.append(ad)
 
-    logger.info(f"Всего собрано {unique_ads.__len__()} уникальных объявлений")
+    logger.info(f"Всего собрано {len(unique_ads)} уникальных объявлений")
     return unique_ads
 
 
