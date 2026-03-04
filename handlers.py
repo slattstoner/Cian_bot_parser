@@ -1,29 +1,37 @@
+#!/usr/bin/env python3
+# handlers.py v1.1 (04.03.2026)
+# - Исправлена статистика (admin_stats_callback, stats)
+# - Добавлена кнопка закрытия тикета для модераторов
+# - Убрана реферальная комиссия, добавлен бонус 14 дней за приглашение
+# - Интегрирована автоматическая проверка TON-транзакций через verify_ton_transaction
+# - Улучшен формат объявлений (send_ad_to_user)
+# - Атомарная отправка (ON CONFLICT) для предотвращения дублей
+# - Обновлён профиль: отображение количества рефералов и полученных бонусов
+
 import json
 import logging
 import asyncio
 import time
 import re
-import sys
 import csv
 import io
 from datetime import datetime
 from typing import List, Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, LabeledPrice
-from telegram.ext import ContextTypes, ConversationHandler, Application, CommandHandler, MessageHandler, \
-    CallbackQueryHandler, filters
+from telegram.ext import ContextTypes, ConversationHandler, CallbackQueryHandler, MessageHandler, filters
 from telegram.constants import ParseMode
 
 from config import (
     ADMIN_ID, TON_WALLET, PAYMENT_PROVIDER_TOKEN, PRICES_RUB, PRICES_TON, PRICES_STARS,
-    PLAN_DAYS, REFERRAL_COMMISSION, PARSING_INTERVAL, TELEGRAM_RATE_LIMIT,
+    PLAN_DAYS, REFERRAL_BONUS_DAYS, PARSING_INTERVAL, TELEGRAM_RATE_LIMIT,
     DISTRICTS, ROOM_OPTIONS, DEAL_TYPE_NAMES, METRO_LINES, ALL_METRO_STATIONS,
     GITHUB_REPO, GITHUB_BRANCH, GITHUB_TOKEN, AUTO_UPDATE_CHECK_INTERVAL
 )
 from database import Database
 from models import Ad
 from parsers import fetch_all_ads
-from utils import validate_txid, truncate_text, check_user_exists, escape_markdown
+from utils import validate_txid, verify_ton_transaction, escape_markdown, check_user_exists
 
 logger = logging.getLogger(__name__)
 
@@ -54,31 +62,6 @@ async def notify_moderators(bot, text: str):
                 pass
 
 
-async def handle_referral_commission(referred_user_id: int, plan: str, currency: str, amount_paid: float, bot):
-    """Начисляет комиссию рефереру"""
-    user = await Database.get_user(referred_user_id)
-    if not user or not user[6]:
-        return
-    referrer_id = user[6]
-    commission = round(amount_paid * (REFERRAL_COMMISSION / 100), 2)
-
-    async with Database._pool.acquire() as conn:
-        await conn.execute('''
-            UPDATE referrals SET commission_paid=TRUE, payment_amount=$1, currency=$3
-            WHERE referred_id=$2
-        ''', commission, referred_user_id, currency)
-
-    await Database.add_to_balance(referrer_id, currency, commission)
-
-    try:
-        await bot.send_message(
-            chat_id=referrer_id,
-            text=f"💰 Вам начислена комиссия {commission:.2f} {currency} за подписку реферала (ID {referred_user_id})."
-        )
-    except Exception as e:
-        logger.error(f"Ошибка уведомления реферера {referrer_id}: {e}")
-
-
 def get_back_keyboard(callback: str = 'main_menu', text: str = '🏠 Главное меню'):
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=callback)]])
 
@@ -98,13 +81,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             referrer_id = int(args[0].split('_')[1])
             if referrer_id != user_id:
                 await Database.set_user_referrer(user_id, referrer_id)
-                try:
-                    await context.bot.send_message(
-                        chat_id=referrer_id,
-                        text=f"🎉 По вашей реферальной ссылке зарегистрировался новый пользователь!"
-                    )
-                except Exception:
-                    pass
+                # Начисляем бонус рефереру
+                bonus_granted = await Database.grant_bonus_to_referrer(user_id, REFERRAL_BONUS_DAYS)
+                if bonus_granted:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=referrer_id,
+                            text=f"🎉 По вашей реферальной ссылке зарегистрировался новый пользователь!\n"
+                                 f"Вам начислено {REFERRAL_BONUS_DAYS} дней подписки в подарок!"
+                        )
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -119,7 +106,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔹 *Мгновенные уведомления* — новые объявления из ЦИАН и Авито сразу после публикации\n"
         "🔹 *Умные фильтры* — поиск по округам, метро, комнатам и типу сделки\n"
         "🔹 *Только собственники* — отсеивайте агентов\n"
-        "🔹 *Реферальная система* — приглашайте друзей и получайте 50% от их подписки\n\n"
+        "🔹 *Реферальная программа* — приглашайте друзей и получайте **14 дней подписки** за каждого!\n\n"
         "💎 *Тарифы:*\n"
         "• 1 месяц — 200 ⭐️ / 1.5 TON / 150 руб\n"
         "• 3 месяца — 500 ⭐️ / 4 TON / 400 руб\n"
@@ -232,7 +219,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += (
             "👑 *Команды администратора:*\n"
             "/admin — панель администратора\n"
-            "/act \\<payment\\_id\\> — активировать подписку по TON\n"
+            "/act \\<payment\\_id\\> — активировать подписку по TON (ручной режим)\n"
             "/grant \\<id\\> \\<days\\> \\[plan\\] — выдать подписку\n"
             "/stats — статистика\n"
             "/find \\<id\\> — поиск пользователя\n"
@@ -290,14 +277,12 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_name = user_tg.full_name or '—'
     username = f"@{user_tg.username}" if user_tg.username else "не указан"
 
-    referrals_text = ""
+    # Рефералы (только статистика, без комиссии)
     referrals = await Database.get_referrals(user_id)
-    if referrals:
-        lines = []
-        for r in referrals[:5]:
-            date_str = datetime.fromtimestamp(r['created_at']).strftime('%d.%m.%Y')
-            lines.append(f"• {r['referred_id']} — {date_str} (комиссия: {r['payment_amount']} {r['currency']})")
-        referrals_text = f"\n\n📊 *Ваши рефералы:*\n" + "\n".join(lines)
+    total_refs = len(referrals)
+    # Количество рефералов, за которые уже получен бонус
+    bonus_refs = sum(1 for r in referrals if r['bonus_granted'])
+    referrals_text = f"\n\n📊 *Приглашено друзей:* {total_refs} (получено бонусов: {bonus_refs} x {REFERRAL_BONUS_DAYS} дн.)"
 
     balance_ton = await Database.get_balance(user_id, 'TON')
     balance_stars = await Database.get_balance(user_id, 'STARS')
@@ -400,7 +385,7 @@ async def pay_ton(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = q.from_user.id
     plan = context.user_data.get('plan', '1m')
     amount = PRICES_TON[plan]
-    payment_id = await Database.add_payment(user_id, amount_ton=amount, plan=plan, source='ton_manual')
+    payment_id = await Database.add_payment(user_id, amount_ton=amount, plan=plan, source='ton_auto')
 
     text = (
         f"*Оплата в TON*\n\n"
@@ -408,18 +393,19 @@ async def pay_ton(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Кошелёк: `{TON_WALLET}`\n\n"
         f"После перевода отправьте команду:\n"
         f"`/pay {payment_id} <TXID>`\n\n"
-        f"Администратор проверит и активирует подписку.\n\n"
+        f"Платёж будет проверен автоматически. Если всё верно, подписка активируется сразу.\n\n"
         f"ID платежа: `{payment_id}`"
     )
     await q.edit_message_text(text, parse_mode='Markdown')
 
 
 async def pay_rub(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"PAYMENT_PROVIDER_TOKEN = {PAYMENT_PROVIDER_TOKEN}")  # ← добавить
+    logger.info(f"PAYMENT_PROVIDER_TOKEN = {PAYMENT_PROVIDER_TOKEN}")
+
     if not PAYMENT_PROVIDER_TOKEN:
-        await update.callback_query.answer("Оплата картой временно недоступна. Выберите другой способ.", show_alert=True)
+        await update.callback_query.answer(
+            "Оплата картой временно недоступна. Выберите другой способ.", show_alert=True)
         return
-    # остальной код...
     q = update.callback_query
     await q.answer()
     plan = context.user_data.get('plan', '1m')
@@ -456,8 +442,6 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         days = PLAN_DAYS.get(plan, 30)
         await Database.activate_subscription(user_id, days, plan, source='payment_telegram')
         await Database.confirm_payment(payment_id)
-        amount = PRICES_RUB[plan]
-        await handle_referral_commission(user_id, plan, 'RUB', amount, context.bot)
         await update.message.reply_text("✅ Оплата прошла успешно! Подписка активирована.")
 
     elif currency == "XTR" and len(parts) >= 4 and parts[0] == 'stars':
@@ -466,8 +450,6 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         days = PLAN_DAYS.get(plan, 30)
         await Database.activate_subscription(user_id, days, plan, source='stars')
         await Database.confirm_payment(payment_id)
-        amount = PRICES_STARS[plan]
-        await handle_referral_commission(user_id, plan, 'STARS', amount, context.bot)
         await update.message.reply_text("✅ Оплата звёздами прошла! Подписка активирована.")
     else:
         await update.message.reply_text("✅ Оплата прошла, но возникла ошибка активации. Обратитесь в поддержку.")
@@ -486,20 +468,39 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Неверный формат TXID. Ожидается 64 шестнадцатеричных символа.")
         return
 
+    # Получаем информацию о платеже
     async with Database._pool.acquire() as conn:
         row = await conn.fetchrow(
-            'SELECT user_id FROM payments WHERE id=$1 AND status=$2', payment_id, 'pending')
+            'SELECT user_id, plan, amount_ton FROM payments WHERE id=$1 AND status=$2',
+            payment_id, 'pending'
+        )
         if not row or row['user_id'] != user_id:
             await update.message.reply_text("Платёж не найден или уже обработан.")
             return
-        await conn.execute('UPDATE payments SET txid=$1 WHERE id=$2', txid, payment_id)
 
-    await update.message.reply_text("✅ TXID сохранён. Администратор проверит и активирует подписку.")
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"💰 Пользователь {user_id} отправил TXID для платежа #{payment_id}:\n`{txid}`",
-        parse_mode='Markdown'
-    )
+        # Проверяем транзакцию через TON API
+        expected_amount = float(row['amount_ton'])
+        if await verify_ton_transaction(txid, expected_amount):
+            # Транзакция подтверждена
+            days = PLAN_DAYS.get(row['plan'], 30)
+            await Database.activate_subscription(user_id, days, row['plan'], source='ton_auto')
+            await conn.execute(
+                "UPDATE payments SET status='confirmed', txid=$1, confirmed_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$2",
+                txid, payment_id
+            )
+            await update.message.reply_text("✅ Платёж подтверждён! Подписка активирована.")
+            # Уведомление админу (опционально)
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"💰 Пользователь {user_id} автоматически активировал подписку (платёж #{payment_id})"
+            )
+        else:
+            # Транзакция не найдена или неверная
+            await conn.execute('UPDATE payments SET txid=$1 WHERE id=$2', txid, payment_id)
+            await update.message.reply_text(
+                "❌ Не удалось подтвердить транзакцию. Проверьте TXID и повторите попытку позже.\n"
+                "Если вы уверены, что перевод выполнен, обратитесь к администратору."
+            )
 
 
 async def pay_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -535,7 +536,6 @@ async def pay_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         currency, amount = available[0]
         await Database.deduct_from_balance(user_id, currency, amount)
         await Database.activate_subscription(user_id, days, plan, source=f'balance_{currency}')
-        await handle_referral_commission(user_id, plan, currency, amount, context.bot)
         await q.edit_message_text(f"✅ Подписка активирована! Списано {amount} {currency}.")
     else:
         keyboard = []
@@ -564,7 +564,6 @@ async def balance_pay_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await Database.deduct_from_balance(user_id, currency, amount)
     await Database.activate_subscription(user_id, days, plan, source=f'balance_{currency}')
-    await handle_referral_commission(user_id, plan, currency, amount, context.bot)
     await q.edit_message_text(f"✅ Подписка активирована! Списано {amount} {currency}.")
 
 
@@ -1040,6 +1039,22 @@ async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /close_ticket <id>")
 
 
+async def close_ticket_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатия кнопки закрытия тикета"""
+    q = update.callback_query
+    await q.answer()
+    user_id = q.from_user.id
+    if user_id != ADMIN_ID and not await Database.has_permission(user_id, 'view_tickets'):
+        await q.edit_message_text("⛔ Нет прав.")
+        return
+    try:
+        ticket_id = int(q.data.split('_')[-1])
+        await Database.close_ticket(ticket_id)
+        await q.edit_message_text(f"✅ Тикет #{ticket_id} закрыт.")
+    except Exception as e:
+        await q.edit_message_text(f"❌ Ошибка: {e}")
+
+
 async def admin_reply_to_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID and not await Database.has_permission(user_id, 'view_tickets'):
@@ -1093,7 +1108,9 @@ async def view_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview = msg['message'][:200]
         text += f"[{time_str}] {sender}:\n{preview}\n\n"
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    # Добавляем кнопку закрытия
+    keyboard = [[InlineKeyboardButton("❌ Закрыть тикет", callback_data=f"close_ticket_{ticket_id}")]]
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 # ========== МОДЕРАТОРСКАЯ ПАНЕЛЬ ==========
@@ -1388,8 +1405,9 @@ async def admin_active_subs_callback(update: Update, context: ContextTypes.DEFAU
         text = "Нет активных подписчиков."
     else:
         text = f"*Активные подписчики ({len(rows)}):*\n\n"
+        now = int(time.time())
         for row in rows[:30]:
-            remaining = (row['subscribed_until'] - int(time.time())) // 86400
+            remaining = (row['subscribed_until'] - now) // 86400
             text += f"• `{row['user_id']}` | {row['plan'] or '—'} | {remaining}д | {row['subscription_source'] or '—'}\n"
         if len(rows) > 30:
             text += f"\n_...и ещё {len(rows) - 30}_"
@@ -2038,9 +2056,11 @@ def matches_filters(ad: Ad, filters_dict: dict) -> bool:
         return False
 
     districts = filters_dict.get('districts', [])
-    if districts and ad.district_detected:
-        if ad.district_detected not in districts:
+    if districts:
+        # Если округ определён и он не в списке – не подходит
+        if ad.district_detected and ad.district_detected not in districts:
             return False
+        # Если округ не определён – пропускаем (не исключаем)
 
     metros = filters_dict.get('metros', [])
     if metros and ad.metro and ad.metro != 'Не указано':
@@ -2091,7 +2111,6 @@ async def send_ad_to_user(bot, user_id: int, ad: Ad, telegram_semaphore):
                 # Уже отправляли этому пользователю
                 return
 
-        # Формируем сообщение
         owner_text = "👤 Собственник" if ad.owner else "🏢 Агент"
         deal_text = "Продажа" if ad.deal_type == 'sale' else "Аренда"
         source_icon = "🏢" if ad.source == 'cian' else "📱"
@@ -2144,11 +2163,11 @@ async def send_ad_to_user(bot, user_id: int, ad: Ad, telegram_semaphore):
                     parse_mode='Markdown',
                     disable_web_page_preview=False
                 )
+
+            await asyncio.sleep(0.1)
+
         except Exception as e:
             logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
-            # Если отправка не удалась, нужно удалить запись из sent_ads, чтобы можно было повторить позже?
-            # По желанию можно добавить удаление, но лучше оставить – объявление не дошло, но помечено как отправленное.
-            # В идеале нужна очередь с повторными попытками.
 
 
 async def collector_loop(app: Application):
@@ -2182,9 +2201,9 @@ async def collector_loop(app: Application):
 
             logger.info(f"Найдено {len(new_ads)} новых объявлений, рассылаем...")
 
-            sent_total = 0
+            # Собираем все задачи для всех объявлений и пользователей
+            all_tasks = []
             for ad in new_ads:
-                tasks = []
                 for row in subscribers:
                     user_id = row['user_id']
                     filters_json = row['filters']
@@ -2195,20 +2214,15 @@ async def collector_loop(app: Application):
                     except Exception:
                         continue
 
-                    if await Database.was_ad_sent_to_user(user_id, ad.id):
-                        continue
-
                     if matches_filters(ad, f):
-                        tasks.append(send_ad_to_user(app.bot, user_id, ad, telegram_semaphore))
-                        sent_total += 1
+                        all_tasks.append(send_ad_to_user(app.bot, user_id, ad, telegram_semaphore))
 
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    await asyncio.sleep(0.5)
+            if all_tasks:
+                await asyncio.gather(*all_tasks, return_exceptions=True)
 
             # Очистка старых объявлений раз в день
             await Database.cleanup_old_ads(days=30)
-            logger.info(f"Рассылка завершена. Отправлено {sent_total} уведомлений")
+            logger.info(f"Рассылка завершена. Отправлено задач: {len(all_tasks)}")
 
         except Exception as e:
             logger.error(f"Ошибка в collector_loop: {e}", exc_info=True)
@@ -2289,5 +2303,3 @@ ADD_MOD_CONV = ConversationHandler(
     fallbacks=[],
     allow_reentry=True
 )
-
-
