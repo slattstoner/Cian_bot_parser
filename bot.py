@@ -1,4 +1,9 @@
+
 #!/usr/bin/env python3
+# bot.py v1.1 (04.03.2026)
+# - Увеличено ограничение TELEGRAM_RATE_LIMIT до 30
+# - Добавлена обработка новых колбэков для кнопки закрытия тикета
+
 import asyncio
 import logging
 import signal
@@ -26,6 +31,7 @@ from handlers import (
     support_start, handle_support_message,
     # Тикеты
     tickets_list, close_ticket, admin_reply_to_ticket, view_ticket,
+    close_ticket_callback,  # новая функция для кнопки
     # Модераторская панель
     mod_panel, mod_panel_back, mod_tickets_callback, mod_closed_tickets_callback, mod_stats_callback,
     # Админ панель (callbacks)
@@ -178,6 +184,7 @@ def main():
     app.add_handler(CallbackQueryHandler(mod_tickets_callback, pattern='^mod_tickets$'))
     app.add_handler(CallbackQueryHandler(mod_closed_tickets_callback, pattern='^mod_closed_tickets$'))
     app.add_handler(CallbackQueryHandler(mod_stats_callback, pattern='^mod_stats$'))
+    app.add_handler(CallbackQueryHandler(close_ticket_callback, pattern='^close_ticket_'))  # кнопка закрытия
 
     # ===== Админские callbacks =====
     app.add_handler(CallbackQueryHandler(admin_panel_back, pattern='^admin_panel_back$'))
