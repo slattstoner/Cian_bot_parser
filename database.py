@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# database.py v1.1 (04.03.2026)
+# - Добавлена функция для начисления бонуса за реферала (add_bonus_days)
+# - Убраны упоминания реферальной комиссии
+# - Атомарные операции с sent_ads оставлены
+
 import asyncpg
 import json
 import time
@@ -42,22 +48,16 @@ class Database:
                 except Exception:
                     pass
 
-            # Таблица рефералов
+            # Таблица рефералов (без комиссии, только для учёта)
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS referrals (
                     id SERIAL PRIMARY KEY,
                     referrer_id BIGINT,
                     referred_id BIGINT UNIQUE,
                     created_at BIGINT,
-                    commission_paid BOOLEAN DEFAULT FALSE,
-                    payment_amount DECIMAL(12,2) DEFAULT 0,
-                    currency VARCHAR(10) DEFAULT 'TON'
+                    bonus_granted BOOLEAN DEFAULT FALSE
                 )
             ''')
-            try:
-                await conn.execute("ALTER TABLE referrals ADD COLUMN IF NOT EXISTS currency VARCHAR(10) DEFAULT 'TON'")
-            except Exception:
-                pass
 
             # Таблица платежей
             await conn.execute('''
@@ -149,7 +149,7 @@ class Database:
                 )
             ''')
 
-            # Таблица балансов
+            # Таблица балансов (оставлена для совместимости, но реферальных комиссий больше нет)
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS balances (
                     user_id BIGINT,
@@ -239,12 +239,37 @@ class Database:
 
     @classmethod
     async def get_referrals(cls, referrer_id: int):
+        """Возвращает список приглашённых пользователей (без комиссии)"""
         async with cls._pool.acquire() as conn:
             rows = await conn.fetch(
-                'SELECT referred_id, created_at, commission_paid, payment_amount, currency FROM referrals WHERE referrer_id = $1',
+                'SELECT referred_id, created_at, bonus_granted FROM referrals WHERE referrer_id = $1',
                 referrer_id
             )
             return rows
+
+    @classmethod
+    async def grant_bonus_to_referrer(cls, referred_id: int, bonus_days: int):
+        """Начисляет бонусные дни рефереру, если ещё не начислял за этого реферала"""
+        async with cls._pool.acquire() as conn:
+            # Получаем referrer_id
+            row = await conn.fetchrow('SELECT referrer_id FROM users WHERE user_id = $1', referred_id)
+            if not row or not row['referrer_id']:
+                return False
+            referrer_id = row['referrer_id']
+
+            # Проверяем, не был ли уже выдан бонус за этого реферала
+            bonus_granted = await conn.fetchval(
+                'SELECT bonus_granted FROM referrals WHERE referred_id = $1', referred_id)
+            if bonus_granted:
+                return False
+
+            # Начисляем бонус рефереру
+            await cls.activate_subscription(referrer_id, bonus_days, source='referral_bonus')
+            # Отмечаем бонус как выданный
+            await conn.execute(
+                'UPDATE referrals SET bonus_granted = TRUE WHERE referred_id = $1', referred_id
+            )
+            return True
 
     # ========== Платежи ==========
     @classmethod
@@ -457,13 +482,10 @@ class Database:
 
     @classmethod
     async def mark_ad_sent(cls, user_id: int, ad_id: str):
-        async with cls._pool.acquire() as conn:
-            await conn.execute(
-                'INSERT INTO sent_ads (user_id, ad_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                user_id, ad_id
-            )
+        # Атомарная вставка с ON CONFLICT используется непосредственно в send_ad_to_user
+        pass
 
-    # ========== Балансы ==========
+    # ========== Балансы (оставлено для совместимости) ==========
     @classmethod
     async def add_to_balance(cls, user_id: int, currency: str, amount: float):
         async with cls._pool.acquire() as conn:
