@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram Real Estate Parser Bot
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/bot
+EnvironmentFile=/opt/bot/.env
+ExecStart=/opt/bot/venv/bin/python /opt/bot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
